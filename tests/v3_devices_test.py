@@ -73,7 +73,7 @@ class SettingsTest(Base):
 
     def test_explicit_solo_resets_a_file_this_version_cannot_read(self):
         vault, state = self.machine()
-        (state / devices.SETTINGS_FILE).write_text(json.dumps({"schema": 1, "level": "computers"}), encoding="utf-8")
+        (state / devices.SETTINGS_FILE).write_text(json.dumps({"schema": 1, "level": "hub"}), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "--level solo"):
             devices.apply(vault, state, {"level": "phone", "phone_sync": "icloud"})
         self.assertEqual(devices.apply(vault, state, {"level": "solo"})["status"], "applied")
@@ -83,7 +83,9 @@ class SettingsTest(Base):
         _, state = self.machine()
         for data in ({"schema": 1, "level": "cluster"}, {"schema": 2, "level": "solo"},
                      {"schema": 1, "level": "phone", "phone_sync": None},
-                     {"schema": 1, "level": "solo", "phone_sync": "icloud"}, ["solo"]):
+                     {"schema": 1, "level": "solo", "phone_sync": "icloud"}, ["solo"],
+                     {"schema": 1, "level": "computers", "branch": "-x"},
+                     {"schema": 1, "level": "computers", "remote_name": ""}):
             (state / devices.SETTINGS_FILE).write_text(json.dumps(data), encoding="utf-8")
             self.assertFalse(devices.read_settings(state)[1], data)
 
@@ -128,7 +130,7 @@ class DetectTest(Base):
         self.assertEqual(list(state.iterdir()), [])
         self.assertFalse(found["git"]["repository"])
         self.assertEqual(found["current_fit"], {"level": "solo", "phone_sync": None})
-        self.assertEqual(set(found["levels"]), {"solo", "phone"})
+        self.assertEqual(set(found["levels"]), {"solo", "phone", "computers"})
         self.assertEqual(found["levels"]["phone"]["needs_per_option"]["other"], [])
 
     def test_current_fit_suggests_the_phone_option_already_in_use(self):
@@ -171,7 +173,10 @@ class PlanTest(Base):
                 ({"level": "phone"}, "needs --phone-sync"),
                 ({"level": "solo", "phone_sync": "icloud"}, "needs --level phone"),
                 ({"phone_sync": "icloud"}, "needs --level phone"),
-                ({"level": "computers"}, "--level must be one of"),
+                ({"level": "hub"}, "--level must be one of"),
+                ({"level": "phone", "phone_sync": "icloud", "git_dir": "/tmp/notes.git"}, "belongs to --level computers"),
+                ({"level": "solo", "remote": "/tmp/hub.git"}, "belongs to --level computers"),
+                ({"level": "computers", "git_dir": "notes.git"}, "absolute path"),
                 ({"level": "phone", "phone_sync": "dropbox"}, "--phone-sync must be one of")):
             with self.assertRaisesRegex(ValueError, message, msg=str(options)):
                 devices.plan(vault, state, options)
@@ -271,7 +276,7 @@ class CliTest(Base):
         code, _, err = self.run_cli(vault, state, "devices", "--level", "phone")
         self.assertEqual(code, 1)
         self.assertIn("only valid with --plan or --apply", err)
-        code, _, err = self.run_cli(vault, state, "devices", "--plan", "--level", "computers")
+        code, _, err = self.run_cli(vault, state, "devices", "--plan", "--level", "hub")
         self.assertNotEqual(code, 0)
         self.assertIn("invalid choice", err)
 
@@ -399,6 +404,133 @@ class ExternalGitDirTest(Base):
         done = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=self.tmp)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(devices.git_command(vault, None, "status"), "git -C '" + str(vault) + "' status")
+
+
+class ComputersLevelTest(Base):
+    # several computers share the vault through a git remote. A synced vault keeps its git
+    # directory outside the vault and only that one computer (the bridge) runs git.
+
+    def icloud_machine(self):
+        vault = self.home / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+        vault.mkdir(parents=True)
+        (vault / "note.md").write_text("# not\n", encoding="utf-8")
+        state = self.tmp / "state"
+        state.mkdir()
+        return vault, state
+
+    def hub(self):
+        bare = self.tmp / "hub.git"
+        git(self.tmp, "init", "-q", "--bare", str(bare))
+        return bare
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_an_unsynced_git_vault_gets_a_remote_and_nothing_else(self):
+        vault, state = self.machine()
+        git(vault, "init", "-q", "-b", "main")
+        before = self.tree(vault)
+        planned = devices.public_plan(devices.plan(vault, state, {"level": "computers"}))
+        self.assertNotIn("actions", planned)
+        self.assertTrue(any("remote add origin" in step for step in planned["manual_steps"]))
+        bare = self.hub()
+        planned = devices.public_plan(devices.plan(vault, state, {"level": "computers", "remote": str(bare)}))
+        self.assertEqual([action["kind"] for action in planned["actions"]], ["set_remote"])
+        self.assertEqual(list(state.iterdir()), [])
+        applied = devices.apply(vault, state, {"level": "computers", "remote": str(bare)})
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(git(vault, "remote", "get-url", "origin"), str(bare))
+        self.assertEqual((devices.status(vault, state)["level"], devices.status(vault, state)["git_dir"]), ("computers", None))
+        self.assertEqual(self.tree(vault), before)
+        self.assertEqual(devices.apply(vault, state, {"level": "computers", "remote": str(bare)})["status"], "unchanged")
+        shown = devices.doctor(state)
+        self.assertEqual((shown["enabled"], shown["level"], shown["git_dir"]), (True, "computers", None))
+
+    def test_a_vault_without_git_is_refused_with_the_way_forward(self):
+        vault, state = self.machine()
+        with self.assertRaisesRegex(devices.DevicesError, "git init.*--git-dir PATH"):
+            devices.plan(vault, state, {"level": "computers"})
+        self.assertEqual(list(state.iterdir()), [])
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_a_synced_vault_runs_git_only_through_its_external_git_directory(self):
+        vault, state = self.icloud_machine()
+        options = {"level": "computers", "phone_sync": "icloud"}
+        with self.assertRaisesRegex(devices.DevicesError, "--git-dir PATH"):
+            devices.plan(vault, state, options)
+        git_dir = self.tmp / "git" / "notes.git"
+        bare = self.hub()
+        options.update(git_dir=str(git_dir), remote=str(bare))
+        planned = devices.public_plan(devices.plan(vault, state, options))
+        self.assertEqual([action["kind"] for action in planned["actions"]], ["init_git_dir", "set_remote"])
+        self.assertFalse(git_dir.exists())
+        self.assertEqual(list(state.iterdir()), [])
+        before = self.tree(vault)
+        self.assertEqual(devices.apply(vault, state, options)["status"], "applied")
+        self.assertEqual(self.tree(vault), before)
+        self.assertEqual(devices.status(vault, state)["git_dir"], str(git_dir))
+        self.assertEqual(devices.bridge_git_dir(vault, state), git_dir)
+        self.assertEqual(devices._git(vault, "remote", "get-url", "origin", git_dir=git_dir).stdout.strip(), str(bare))
+        # The stored directory is reused: later runs need neither --git-dir nor --remote.
+        self.assertEqual(devices.apply(vault, state, {"level": "computers"})["status"], "unchanged")
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_a_git_entry_inside_a_synced_vault_is_never_moved(self):
+        vault, state = self.icloud_machine()
+        (vault / ".git").write_text("gitdir: /Users/someone/notes.git\n", encoding="utf-8")
+        with self.assertRaisesRegex(devices.DevicesError, ".git entry"):
+            devices.apply(vault, state, {"level": "computers", "phone_sync": "icloud",
+                                         "git_dir": str(self.tmp / "notes.git")})
+        self.assertFalse((self.tmp / "notes.git").exists())
+        self.assertEqual((vault / ".git").read_text(encoding="utf-8"), "gitdir: /Users/someone/notes.git\n")
+        self.assertEqual(list(state.iterdir()), [])
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_unsafe_remotes_are_refused(self):
+        vault, state = self.machine()
+        git(vault, "init", "-q", "-b", "main")
+        for remote, reason in (("https://me:secret@example.com/notes.git", "password"),
+                               (str(vault / "hub.git"), "outside the vault"),
+                               ("-uhack", "dash")):
+            with self.subTest(remote=remote):
+                with self.assertRaisesRegex(devices.DevicesError, reason):
+                    devices.plan(vault, state, {"level": "computers", "remote": remote})
+        self.assertNotIn("origin", git(vault, "remote"))
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_going_back_to_solo_keeps_the_git_directory(self):
+        vault, state = self.icloud_machine()
+        git_dir = self.tmp / "notes.git"
+        devices.apply(vault, state, {"level": "computers", "phone_sync": "icloud", "git_dir": str(git_dir)})
+        planned = devices.apply(vault, state, {"level": "phone"})
+        self.assertEqual(planned["status"], "applied")
+        self.assertTrue(devices.is_git_dir(vault, git_dir))
+        self.assertEqual(devices.status(vault, state)["git_dir"], str(git_dir))
+
+    def test_detect_lists_what_the_computers_level_needs(self):
+        vault, state = self.icloud_machine()
+        needs = devices.detect(vault, state)["levels"]["computers"]["needs"]
+        self.assertTrue(any("--git-dir" in need for need in needs))
+        plain, plain_state = self.machine()
+        with mock.patch.object(devices.shutil, "which", return_value=None):
+            self.assertTrue(any("git" in need for need in devices.detect(plain, plain_state)["levels"]["computers"]["needs"]))
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_cli_plans_and_applies_the_computers_level(self):
+        vault, state = self.icloud_machine()
+        git_dir = self.tmp / "notes.git"
+        cli = CliTest(methodName="run_cli")
+        cli.home = self.home
+        code, out, err = cli.run_cli(vault, state, "devices", "--plan", "--level", "computers", "--phone-sync",
+                                     "icloud", "--git-dir", str(git_dir))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["actions"][0]["kind"], "init_git_dir")
+        code, out, err = cli.run_cli(vault, state, "devices", "--apply", "--level", "computers", "--phone-sync",
+                                     "icloud", "--git-dir", str(git_dir))
+        self.assertEqual(code, 0, err)
+        self.assertTrue(devices.is_git_dir(vault, git_dir))
+        code, _, err = cli.run_cli(vault, state, "devices", "--git-dir", str(git_dir))
+        self.assertEqual(code, 1)
+        self.assertIn("only valid with --plan or --apply", err)
+
 
 if __name__ == "__main__":
     unittest.main()

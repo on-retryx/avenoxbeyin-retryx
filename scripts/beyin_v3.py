@@ -1265,8 +1265,10 @@ def parser(note_namespace=None, is_json=False):
     devices_action.add_argument("--detect", action="store_true", help="Describe this machine and the levels it is ready for; writes nothing")
     devices_action.add_argument("--plan", action="store_true", help="Show what --apply would store and the steps left to you; writes nothing")
     devices_action.add_argument("--apply", action="store_true", help="Store the chosen level in the runtime state; writes nothing in the vault")
-    devices.add_argument("--level", choices=["solo", "phone"], help="solo: one computer; phone: + phone or tablet via a file sync service")
+    devices.add_argument("--level", choices=["solo", "phone", "computers"], help="solo: one computer; phone: + phone or tablet via a file sync service; computers: several computers through a git remote")
     devices.add_argument("--phone-sync", choices=["icloud", "obsidian-sync", "other"], help="How the phone sees the vault")
+    devices.add_argument("--git-dir", help="computers: absolute path of the vault's git directory, kept outside the vault (needed when the vault is in a file sync folder)")
+    devices.add_argument("--remote", help="computers: URL of the private repository the computers share")
     context = sub.add_parser("context", help="Retrieve source-backed shared context")
     context.add_argument("query", nargs="?", help="Query; alternatively use --file")
     context.add_argument("--file", help="JSON retrieval arguments, or - for stdin")
@@ -2217,7 +2219,7 @@ def main(argv=None, return_result=False):
         elif args.command == "devices":
             _ensure_scripts_path()
             import beyin_v3_devices as devices_mod
-            options = {"level": args.level, "phone_sync": args.phone_sync}
+            options = {"level": args.level, "phone_sync": args.phone_sync, "git_dir": args.git_dir, "remote": args.remote}
             given = [name for name, value in options.items() if value is not None]
             if given and not (args.plan or args.apply):
                 raise ValueError("--" + given[0].replace("_", "-") + " is only valid with --plan or --apply")

@@ -1,22 +1,24 @@
 """devices: opt-in, staged multi-device layout for one vault. Off by default.
 
 Beyin stays local-first: nothing here runs unless the user asks for it, and the default
-installation is unchanged. This first step covers the two levels that need no git and no
-background job:
+installation is unchanged. Levels:
 
 - `solo`   one computer. The default; nothing is configured.
 - `phone`  one computer plus phones/tablets through a file sync service the user already has:
            iCloud Drive (free, Apple devices), Obsidian Sync (paid, any platform) or another
            service. Beyin runs on the computer; the phone reads and edits notes in Obsidian.
+- `computers` several computers share the vault through a git remote the user owns. A vault that
+           a file sync service also carries keeps its git directory outside the vault, and only
+           the computer that registered it (the bridge) runs git (see the section at the end).
+           This level prepares the repository and the remote; sync rounds come in a later step.
 
-Git-based levels (several computers, an always-on hub) are discussed in #205. Their groundwork is
-here: a synced vault keeps its git directory outside the vault (see the section at the end); the
-levels themselves are not exposed yet.
+An always-on hub is discussed in #205 and not exposed yet.
 
 Rules this module keeps:
 
-- `--detect` and `--plan` write nothing and make no network call. `--apply` writes only the
-  settings file in the machine-local runtime state; it never writes into the vault.
+- `--detect` and `--plan` write nothing and make no network call. `--apply` writes the settings
+  file in the machine-local runtime state and, at the computers level, git metadata (a git
+  directory outside the vault, a remote URL); it never writes into the vault.
 - Settings live in the runtime state, never in the vault, so they are not synchronised to a
   device they do not describe and a rollback to an older engine ignores them.
 - Standard library only.
@@ -26,15 +28,21 @@ import os
 from pathlib import Path
 import secrets
 import shlex
+import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 
 SETTINGS_FILE = 'devices.json'
-LEVELS = ('solo', 'phone')
+LEVELS = ('solo', 'phone', 'computers')
 PHONE_SYNCS = ('icloud', 'obsidian-sync', 'other')
 GIT_TIMEOUT = 20
 DOC = 'docs/v3/DEVICES.md'
+_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,63}')
+BRIDGE_REFUSAL = ('This vault is in a file sync folder. Git sync runs only on the one computer that keeps the '
+                  'vault\'s git directory outside the synced folder; register it there with --git-dir PATH. '
+                  'Other devices see the notes through the sync service (see ' + DOC + ').')
 _SERVICES = (
     ('Library/Mobile Documents/iCloud~md~obsidian/', 'icloud', True),
     ('Library/Mobile Documents/', 'icloud', False),
@@ -72,7 +80,8 @@ def _atomic(path, text):
 # ---------------------------------------------------------------- settings
 
 def default_settings():
-    return {'schema': 1, 'level': 'solo', 'phone_sync': None, 'git_dir': None}
+    return {'schema': 1, 'level': 'solo', 'phone_sync': None, 'git_dir': None, 'remote_name': 'origin',
+            'branch': 'main'}
 
 
 def _valid(data):
@@ -83,7 +92,12 @@ def _valid(data):
     git_dir = data.get('git_dir')
     if git_dir is not None and not (isinstance(git_dir, str) and os.path.isabs(git_dir)):
         return False
-    return (data['level'] == 'phone') == (data['phone_sync'] is not None)
+    for key in ('remote_name', 'branch'):
+        if not (isinstance(data.get(key), str) and _NAME.fullmatch(data[key]) and '..' not in data[key]):
+            return False
+    if data['level'] == 'solo':
+        return data['phone_sync'] is None
+    return data['level'] == 'computers' or data['phone_sync'] is not None
 
 
 def read_settings(state):
@@ -112,8 +126,11 @@ def doctor(state):
     settings, valid = read_settings(state)
     if valid and settings['level'] == 'solo':
         return {'enabled': False}
-    return {'enabled': settings['level'] != 'solo', 'valid': valid, 'level': settings['level'],
-            'phone_sync': settings['phone_sync']}
+    result = {'enabled': settings['level'] != 'solo', 'valid': valid, 'level': settings['level'],
+              'phone_sync': settings['phone_sync']}
+    if settings['level'] == 'computers':
+        result['git_dir'] = settings['git_dir']
+    return result
 
 
 # ---------------------------------------------------------------- read-only git facts
@@ -210,7 +227,16 @@ def _eligibility(found):
         phone['icloud'].append('move the vault under iCloud Drive/Obsidian (see ' + DOC + ')')
     if not found['obsidian']['sync_plugin']:
         phone['obsidian-sync'].append('an Obsidian Sync subscription and the Sync core plugin turned on in this vault')
-    return {'solo': {'needs': []}, 'phone': {'needs_per_option': phone}}
+    computers = []
+    if not shutil.which('git'):
+        computers.append('git installed on every computer')
+    if found['vault_sync_service'] or found['obsidian']['syncthing']:
+        computers.append('this vault is in a file sync folder: only one computer may run git on it, with its git '
+                         'directory outside the vault (--git-dir PATH)')
+    elif not found['git']['repository']:
+        computers.append('a git repository: `git init` in the vault, or --git-dir PATH outside it')
+    computers.append('a private remote repository every computer can reach (--remote URL)')
+    return {'solo': {'needs': []}, 'phone': {'needs_per_option': phone}, 'computers': {'needs': computers}}
 
 
 def _current_fit(found):
@@ -240,11 +266,21 @@ def normalize(options, state):
         raise DevicesError('--phone-sync must be one of: ' + ', '.join(PHONE_SYNCS))
     if level == 'solo':
         if options.get('phone_sync'):
-            raise DevicesError('--phone-sync needs --level phone')
+            raise DevicesError('--phone-sync needs --level phone or computers')
         phone_sync = None
-    elif not phone_sync:
+    elif level == 'phone' and not phone_sync:
         raise DevicesError('--level phone needs --phone-sync ' + '|'.join(PHONE_SYNCS))
-    return {**stored, 'schema': 1, 'level': level, 'phone_sync': phone_sync}
+    if level != 'computers':
+        for key in ('git_dir', 'remote'):
+            if options.get(key):
+                raise DevicesError('--' + key.replace('_', '-') + ' belongs to --level computers')
+    git_dir = stored['git_dir']
+    if options.get('git_dir'):
+        given = Path(str(options['git_dir'])).expanduser()
+        if not given.is_absolute():
+            raise DevicesError('--git-dir must be an absolute path')
+        git_dir = str(given.resolve())
+    return {**stored, 'schema': 1, 'level': level, 'phone_sync': phone_sync, 'git_dir': git_dir}
 
 
 def plan(vault, state, options):
@@ -265,8 +301,10 @@ def plan(vault, state, options):
         if not location['obsidian_ios_folder']:
             manual.append('Move the vault into iCloud Drive/Obsidian so the iPhone or iPad Obsidian app can open it, '
                           'then run the installer with --rebind-state (docs/v3/MULTI-MACHINE.md, moving a vault).')
-        manual.append('On the phone: install Obsidian, choose "Open folder as vault" under iCloud Drive/Obsidian. '
-                      'Run Beyin on one computer only at this level; the phone reads and edits notes.')
+        manual.append('On the phone: install Obsidian, choose "Open folder as vault" under iCloud Drive/Obsidian. ' +
+                      ('Run Beyin on one computer only at this level; the phone reads and edits notes.'
+                       if settings['level'] == 'phone' else
+                       'This Mac is the only bridge between iCloud and git; other computers use git only.'))
         warnings.append('iCloud also uploads hidden folders. .beyin-note-write/ holds note backups; they stay in your own '
                         'iCloud account. Do not keep the vault in iCloud and Obsidian Sync at the same time.')
     elif choice == 'obsidian-sync':
@@ -279,7 +317,7 @@ def plan(vault, state, options):
     elif choice == 'other':
         manual.append('Exclude .beyin-note-write/ and any .git folder from your sync service if it allows exclusions. '
                       'Conflict copies the service creates are reported by `beyin.py sync`, never merged or deleted.')
-    facts = _git_facts(vault) if choice and vault_synced(vault, choice) else {}
+    facts = _git_facts(vault) if settings['level'] == 'phone' and vault_synced(vault, choice) else {}
     if facts.get('git_dir_inside_vault'):
         warnings.append('This vault is a git repository whose .git folder is inside the synced folder. File sync '
                         'services corrupt git data and carry it to other devices; keep the git directory outside the '
@@ -287,21 +325,100 @@ def plan(vault, state, options):
     elif facts.get('git_file_in_vault'):
         warnings.append('The vault holds a .git file that points to this machine\'s git directory by absolute path. '
                         'A file sync service carries it to other devices, where that path is wrong (see ' + DOC + ').')
+    actions = []
+    if settings['level'] == 'computers':
+        actions, steps = _computers_plan(vault, settings, options.get('remote'))
+        manual.extend(steps)
     return {'level': settings['level'], 'phone_sync': choice, 'manual_steps': manual, 'warnings': warnings,
-            'settings': settings, 'changes_settings': not valid or settings != stored}
+            'actions': actions, 'settings': settings, 'changes_settings': not valid or settings != stored}
 
 
 def public_plan(result):
     """The plan as shown to a person."""
-    return {key: value for key, value in result.items() if key != 'settings'}
+    return {key: value for key, value in result.items()
+            if key != 'settings' and not (key == 'actions' and not value)}
 
 
 def apply(vault, state, options):
-    """Store the chosen level in the runtime state. Nothing in the vault is written."""
+    """Store the chosen level in the runtime state and run the planned git steps. Nothing in the
+    vault is written."""
     planned = plan(vault, state, options)
+    for action in planned['actions']:
+        _execute(vault, planned['settings'], action)
     if planned['changes_settings']:
         _atomic(Path(state) / SETTINGS_FILE, json.dumps(planned['settings'], ensure_ascii=False, indent=2) + '\n')
-    return {**public_plan(planned), 'status': 'applied' if planned['changes_settings'] else 'unchanged'}
+    changed = planned['changes_settings'] or bool(planned['actions'])
+    return {**public_plan(planned), 'status': 'applied' if changed else 'unchanged'}
+
+
+def _remote_problem(vault, url):
+    """Why this remote URL is refused, or None. Nothing is contacted."""
+    if not url or url.startswith('-'):
+        return 'must not be empty or start with a dash'
+    if any(ord(char) < 32 for char in url):
+        return 'must not contain control characters'
+    parts = urllib.parse.urlsplit(url)
+    if parts.password:
+        return 'must not contain a password; use an SSH key or a git credential helper'
+    local = parts.path if parts.scheme == 'file' else url if os.path.isabs(url) else None
+    if local:
+        path, vault = Path(local).expanduser().resolve(), Path(vault).resolve()
+        if path == vault or vault in path.parents:
+            return 'must be outside the vault'
+        if sync_location(path)['service']:
+            return 'must not be inside a file sync folder: a synced git repository gets corrupted'
+    return None
+
+
+def _computers_plan(vault, settings, remote):
+    """Git steps for the computers level: (actions, manual steps). Reads local git only."""
+    vault = Path(vault).resolve()
+    git_dir, actions, manual = settings['git_dir'], [], []
+    if git_dir:
+        problem = git_dir_problem(vault, git_dir)
+        if problem:
+            raise DevicesError('--git-dir ' + problem)
+        if (vault / '.git').exists():
+            raise DevicesError('the vault already has a .git entry; Beyin does not move or delete it. Move the '
+                               'repository out by hand first, then use --git-dir (see ' + DOC + ').')
+        path = Path(git_dir)
+        if not is_git_dir(vault, path):
+            if path.exists() and (not path.is_dir() or any(path.iterdir())):
+                raise DevicesError('--git-dir must be an empty or new folder, or an existing git directory')
+            actions.append({'kind': 'init_git_dir', 'summary': 'create the vault\'s git directory outside the vault: '
+                            + git_dir, 'git_dir': git_dir})
+    elif vault_synced(vault, settings['phone_sync']):
+        raise DevicesError(BRIDGE_REFUSAL)
+    elif not _git_facts(vault)['repository']:
+        raise DevicesError('--level computers needs git: run `git init` in the vault, or keep the git directory '
+                           'outside it with --git-dir PATH')
+    name = settings['remote_name']
+    current = None
+    if not actions:
+        done = _git(vault, 'remote', 'get-url', name, git_dir=git_dir)
+        current = done.stdout.strip() if done.returncode == 0 else None
+    if remote:
+        problem = _remote_problem(vault, remote)
+        if problem:
+            raise DevicesError('--remote ' + problem)
+        if remote != current:
+            actions.append({'kind': 'set_remote', 'summary': ('change' if current else 'add') + ' git remote ' + name
+                            + ': ' + remote, 'name': name, 'url': remote, 'replace': bool(current)})
+    elif not current:
+        manual.append('Connect a private repository that every computer can reach: '
+                      + git_command(vault, git_dir, 'remote', 'add', name, 'URL') + ' (or --remote URL).')
+    return actions, manual
+
+
+def _execute(vault, settings, action):
+    git_dir = settings['git_dir']
+    if action['kind'] == 'init_git_dir':
+        init_external_git(vault, git_dir, settings['branch'])
+    elif action['kind'] == 'set_remote':
+        done = _git(vault, 'remote', 'set-url' if action['replace'] else 'add', action['name'], action['url'],
+                    git_dir=git_dir)
+        if done.returncode != 0:
+            raise DevicesError('git remote failed: ' + (done.stderr or '').strip()[-300:])
 
 
 # ---------------------------------------------------------------- external git directory
@@ -390,9 +507,7 @@ def bridge_git_dir(vault, state):
     if not registered and not vault_synced(vault, settings.get('phone_sync')):
         return None
     if not registered:
-        raise DevicesError('This vault is in a file sync folder. Git sync runs only on the one computer that keeps the '
-                           'vault\'s git directory outside the synced folder; register it there with --git-dir PATH. '
-                           'Other devices see the notes through the sync service (see ' + DOC + ').')
+        raise DevicesError(BRIDGE_REFUSAL)
     problem = git_dir_problem(vault, registered)
     if problem:
         raise DevicesError('The registered git directory ' + problem + ': ' + registered)
