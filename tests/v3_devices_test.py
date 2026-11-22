@@ -288,5 +288,117 @@ class CliTest(Base):
         self.assertEqual((shown["enabled"], shown["level"], shown["phone_sync"]), (True, "phone", "icloud"))
 
 
+class ExternalGitDirTest(Base):
+    """Groundwork for git levels: the git directory of a synced vault lives outside it."""
+
+    def icloud_machine(self):
+        vault = self.home / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+        vault.mkdir(parents=True)
+        state = self.tmp / "state"
+        state.mkdir()
+        return vault, state
+
+    def store(self, state, **settings):
+        (state / devices.SETTINGS_FILE).write_text(json.dumps({**devices.default_settings(), **settings}), encoding="utf-8")
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_init_writes_nothing_into_the_vault_and_git_works_through_the_arguments(self):
+        vault, state = self.icloud_machine()
+        (vault / "note.md").write_text("# not\n", encoding="utf-8")
+        before = self.tree(vault)
+        git_dir = self.tmp / "git" / "notes.git"
+        self.assertEqual(devices.init_external_git(vault, git_dir)["status"], "created")
+        self.assertEqual(self.tree(vault), before)
+        for args in (("add", "-A"), ("-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-m", "first")):
+            self.assertEqual(devices._git(vault, *args, git_dir=git_dir).returncode, 0)
+        self.assertEqual(self.tree(vault), before)
+        self.assertEqual(devices._git(vault, "symbolic-ref", "--short", "HEAD", git_dir=git_dir).stdout.strip(), "main")
+        self.assertEqual(devices._git(vault, "ls-files", git_dir=git_dir).stdout.split(), ["note.md"])
+        self.assertEqual(devices.init_external_git(vault, git_dir)["status"], "unchanged")
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_git_environment_variables_do_not_redirect_the_calls(self):
+        vault, state = self.machine()
+        git_dir = self.tmp / "notes.git"
+        devices.init_external_git(vault, git_dir)
+        other = self.tmp / "other"
+        other.mkdir()
+        git(other, "init", "-q")
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)}):
+            top = devices._git(vault, "rev-parse", "--absolute-git-dir", git_dir=git_dir).stdout.strip()
+        self.assertEqual(Path(top).resolve(), git_dir.resolve())
+
+    def test_unsafe_git_dir_locations_are_refused(self):
+        vault, state = self.icloud_machine()
+        cases = {
+            "relative/notes.git": "absolute",
+            str(vault / "inner.git"): "outside the vault",
+            str(vault.parent): "contains the vault",
+            str(self.home / "Library/Mobile Documents/com~apple~CloudDocs/notes.git"): "file sync folder",
+        }
+        for path, reason in cases.items():
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(devices.DevicesError, reason):
+                    devices.init_external_git(vault, path)
+        self.assertFalse((vault / "inner.git").exists())
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_an_existing_git_entry_or_a_foreign_folder_is_left_alone(self):
+        vault, state = self.machine()
+        busy = self.tmp / "busy"
+        busy.mkdir()
+        (busy / "keep.txt").write_text("x", encoding="utf-8")
+        with self.assertRaisesRegex(devices.DevicesError, "holds other files"):
+            devices.init_external_git(vault, busy)
+        self.assertEqual(self.tree(busy), ["keep.txt"])
+        git(vault, "init", "-q")
+        with self.assertRaisesRegex(devices.DevicesError, "already has a .git"):
+            devices.init_external_git(vault, self.tmp / "new.git")
+        self.assertFalse((self.tmp / "new.git").exists())
+
+    def test_settings_keep_only_an_absolute_git_dir(self):
+        vault, state = self.machine()
+        self.store(state, git_dir=str(self.tmp / "notes.git"))
+        settings, valid = devices.read_settings(state)
+        self.assertTrue(valid)
+        self.assertEqual(settings["git_dir"], str(self.tmp / "notes.git"))
+        self.store(state, git_dir="notes.git")
+        self.assertFalse(devices.read_settings(state)[1])
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_only_the_registered_bridge_may_run_git_on_a_synced_vault(self):
+        vault, state = self.icloud_machine()
+        with self.assertRaisesRegex(devices.DevicesError, "--git-dir PATH"):
+            devices.bridge_git_dir(vault, state)
+        git_dir = self.tmp / "notes.git"
+        self.store(state, git_dir=str(git_dir))
+        with self.assertRaisesRegex(devices.DevicesError, "missing or is not a git repository"):
+            devices.bridge_git_dir(vault, state)
+        devices.init_external_git(vault, git_dir)
+        self.assertEqual(devices.bridge_git_dir(vault, state), git_dir)
+        (vault / ".git").write_text("gitdir: /Users/someone/notes.git\n", encoding="utf-8")
+        with self.assertRaisesRegex(devices.DevicesError, ".git entry"):
+            devices.bridge_git_dir(vault, state)
+
+    def test_an_unsynced_vault_keeps_an_ordinary_git_folder(self):
+        vault, state = self.machine()
+        self.assertIsNone(devices.bridge_git_dir(vault, state))
+        self.store(state, level="phone", phone_sync="icloud")
+        with self.assertRaisesRegex(devices.DevicesError, "file sync folder"):
+            devices.bridge_git_dir(vault, state)
+
+    @unittest.skipUnless(GIT, "git is required")
+    @unittest.skipIf(os.name == "nt", "POSIX shell quoting")
+    def test_the_printed_command_can_be_pasted_as_is(self):
+        vault = self.tmp / "My Notes ü"
+        vault.mkdir()
+        git_dir = self.tmp / "git dir" / "notes.git"
+        devices.init_external_git(vault, git_dir)
+        command = devices.git_command(vault, git_dir, "status", "--short")
+        self.assertIn("--work-tree=", command)
+        done = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=self.tmp)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(devices.git_command(vault, None, "status"), "git -C '" + str(vault) + "' status")
+
 if __name__ == "__main__":
     unittest.main()

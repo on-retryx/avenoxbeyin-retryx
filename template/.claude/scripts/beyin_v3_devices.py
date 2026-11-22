@@ -9,8 +9,9 @@ background job:
            iCloud Drive (free, Apple devices), Obsidian Sync (paid, any platform) or another
            service. Beyin runs on the computer; the phone reads and edits notes in Obsidian.
 
-Git-based levels (several computers, an always-on hub) are discussed in #205 and are not part
-of this module yet.
+Git-based levels (several computers, an always-on hub) are discussed in #205. Their groundwork is
+here: a synced vault keeps its git directory outside the vault (see the section at the end); the
+levels themselves are not exposed yet.
 
 Rules this module keeps:
 
@@ -24,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -70,13 +72,16 @@ def _atomic(path, text):
 # ---------------------------------------------------------------- settings
 
 def default_settings():
-    return {'schema': 1, 'level': 'solo', 'phone_sync': None}
+    return {'schema': 1, 'level': 'solo', 'phone_sync': None, 'git_dir': None}
 
 
 def _valid(data):
     if not isinstance(data, dict) or data.get('schema') != 1:
         return False
     if data.get('level') not in LEVELS or data.get('phone_sync') not in (None, *PHONE_SYNCS):
+        return False
+    git_dir = data.get('git_dir')
+    if git_dir is not None and not (isinstance(git_dir, str) and os.path.isabs(git_dir)):
         return False
     return (data['level'] == 'phone') == (data['phone_sync'] is not None)
 
@@ -113,17 +118,26 @@ def doctor(state):
 
 # ---------------------------------------------------------------- read-only git facts
 
-def _git(vault, *args):
+def git_dir_args(vault, git_dir):
+    """Point git at a git directory kept outside the vault. Passed on every call instead of a
+    `.git` file, so nothing machine-specific is written into a synced vault."""
+    return ['--git-dir=' + str(git_dir), '--work-tree=' + str(vault)] if git_dir else []
+
+
+def _git(vault, *args, git_dir=None, timeout=GIT_TIMEOUT):
     exe = shutil.which('git')
     if not exe:
         return subprocess.CompletedProcess(args, 127, '', 'git not found')
     env = dict(os.environ)
     env.update({'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C', 'LANGUAGE': 'C'})
+    for name in ('GIT_DIR', 'GIT_WORK_TREE'):  # only the explicit arguments decide the repository
+        env.pop(name, None)
+    argv = [exe, '-C', str(vault), *git_dir_args(vault, git_dir), '-c', 'core.quotePath=false', *args]
     try:
-        return subprocess.run([exe, '-C', str(vault), '-c', 'core.quotePath=false', *args], capture_output=True, text=True,
-                              encoding='utf-8', errors='replace', timeout=GIT_TIMEOUT, env=env)
+        return subprocess.run(argv, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(args, 124, '', 'timeout after ' + str(GIT_TIMEOUT) + 's')
+        return subprocess.CompletedProcess(args, 124, '', 'timeout after ' + str(timeout) + 's')
 
 
 def _git_facts(vault):
@@ -265,9 +279,7 @@ def plan(vault, state, options):
     elif choice == 'other':
         manual.append('Exclude .beyin-note-write/ and any .git folder from your sync service if it allows exclusions. '
                       'Conflict copies the service creates are reported by `beyin.py sync`, never merged or deleted.')
-    # Obsidian Sync skips hidden folders; iCloud, Syncthing, Dropbox and the like carry them.
-    synced = choice in ('icloud', 'other') or location['service'] or (Path(vault) / '.stfolder').exists()
-    facts = _git_facts(vault) if choice and synced else {}
+    facts = _git_facts(vault) if choice and vault_synced(vault, choice) else {}
     if facts.get('git_dir_inside_vault'):
         warnings.append('This vault is a git repository whose .git folder is inside the synced folder. File sync '
                         'services corrupt git data and carry it to other devices; keep the git directory outside the '
@@ -290,3 +302,103 @@ def apply(vault, state, options):
     if planned['changes_settings']:
         _atomic(Path(state) / SETTINGS_FILE, json.dumps(planned['settings'], ensure_ascii=False, indent=2) + '\n')
     return {**public_plan(planned), 'status': 'applied' if planned['changes_settings'] else 'unchanged'}
+
+
+# ---------------------------------------------------------------- external git directory
+#
+# Git and a file sync service must not share a folder: the service corrupts git data, and
+# `git init --separate-git-dir` leaves a `.git` file with this machine's absolute path that the
+# service carries to every other device. So when the vault is synced, its git directory lives
+# outside the vault, its path is kept in the runtime state (devices.json) and every git call
+# names it with --git-dir/--work-tree. Only the computer that registered such a directory may
+# run git levels on a synced vault: one bridge, the other devices see notes through the service.
+
+def vault_synced(vault, phone_sync=None):
+    """Whether a file sync service carries this vault, hidden folders included. Obsidian Sync
+    skips hidden folders; iCloud, Syncthing, Dropbox and the like carry them."""
+    return bool(phone_sync in ('icloud', 'other') or sync_location(vault)['service'] or
+                (Path(vault) / '.stfolder').exists())
+
+
+def git_dir_problem(vault, git_dir):
+    """Why this path cannot hold the vault's git directory, or None."""
+    path = Path(str(git_dir)).expanduser()
+    if not path.is_absolute():
+        return 'must be an absolute path'
+    path, vault = path.resolve(), Path(vault).resolve()
+    if path == vault or vault in path.parents:
+        return 'must be outside the vault'
+    if path in vault.parents:
+        return 'must not be a folder that contains the vault'
+    if sync_location(path)['service']:
+        return 'must not be inside a file sync folder: a synced git directory gets corrupted'
+    return None
+
+
+def is_git_dir(vault, git_dir):
+    path = Path(git_dir)
+    if not path.is_dir():
+        return False
+    done = _git(vault, 'rev-parse', '--absolute-git-dir', git_dir=path, timeout=GIT_TIMEOUT)
+    try:
+        return done.returncode == 0 and Path(done.stdout.strip()).resolve() == path.resolve()
+    except OSError:
+        return False
+
+
+def init_external_git(vault, git_dir, branch='main'):
+    """Create the vault's git directory outside the vault. Writes nothing into the vault: no
+    `.git` folder and no `.git` file. An existing git directory at that path is reused."""
+    vault = Path(vault).resolve()
+    problem = git_dir_problem(vault, git_dir)
+    if problem:
+        raise DevicesError('--git-dir ' + problem)
+    path = Path(str(git_dir)).expanduser().resolve()
+    if (vault / '.git').exists():
+        raise DevicesError('the vault already has a .git entry; Beyin does not move or delete it. Move the repository '
+                           'out by hand first (see ' + DOC + ').')
+    if path.exists() and not path.is_dir():
+        raise DevicesError('--git-dir exists and is not a folder')
+    if path.is_dir() and any(path.iterdir()):
+        if is_git_dir(vault, path):
+            return {'status': 'unchanged', 'git_dir': str(path)}
+        raise DevicesError('--git-dir is a folder that holds other files; choose an empty or new folder')
+    path.mkdir(parents=True, exist_ok=True)
+    done = _git(vault, 'init', '-q', git_dir=path)
+    if done.returncode != 0:
+        raise DevicesError('git init failed: ' + (done.stderr or '').strip()[-300:])
+    # --initial-branch needs git 2.28; pointing HEAD works on older versions too.
+    _git(vault, 'symbolic-ref', 'HEAD', 'refs/heads/' + branch, git_dir=path)
+    return {'status': 'created', 'git_dir': str(path)}
+
+
+def git_command(vault, git_dir, *args):
+    """The git command a person can paste into a terminal, aimed at the same repository Beyin uses."""
+    parts = ['git', *(git_dir_args(vault, git_dir) or ['-C', str(vault)]), *args]
+    return subprocess.list2cmdline(parts) if os.name == 'nt' else shlex.join(parts)
+
+
+def bridge_git_dir(vault, state):
+    """The git directory git levels must use on this machine, or None for an ordinary `.git`
+    folder in an unsynced vault. Raises DevicesError when a synced vault has no registered
+    external git directory here: that machine is not the bridge and must not run git."""
+    vault = Path(vault).resolve()
+    settings, valid = read_settings(state)
+    if not valid:
+        raise DevicesError(SETTINGS_FILE + ' in the runtime state is invalid; fix or remove it first')
+    registered = settings.get('git_dir')
+    if not registered and not vault_synced(vault, settings.get('phone_sync')):
+        return None
+    if not registered:
+        raise DevicesError('This vault is in a file sync folder. Git sync runs only on the one computer that keeps the '
+                           'vault\'s git directory outside the synced folder; register it there with --git-dir PATH. '
+                           'Other devices see the notes through the sync service (see ' + DOC + ').')
+    problem = git_dir_problem(vault, registered)
+    if problem:
+        raise DevicesError('The registered git directory ' + problem + ': ' + registered)
+    if (vault / '.git').exists():
+        raise DevicesError('The vault holds a .git entry next to the registered git directory; remove the one in the '
+                           'vault by hand so only ' + registered + ' is used (see ' + DOC + ').')
+    if not is_git_dir(vault, registered):
+        raise DevicesError('The registered git directory is missing or is not a git repository: ' + registered)
+    return Path(registered)
