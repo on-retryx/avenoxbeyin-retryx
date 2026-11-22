@@ -424,22 +424,24 @@ class ComputersLevelTest(Base):
         return bare
 
     @unittest.skipUnless(GIT, "git is required")
-    def test_an_unsynced_git_vault_gets_a_remote_and_nothing_else(self):
+    def test_an_unsynced_git_vault_gets_a_remote_and_git_rules_only(self):
         vault, state = self.machine()
         git(vault, "init", "-q", "-b", "main")
         before = self.tree(vault)
         planned = devices.public_plan(devices.plan(vault, state, {"level": "computers"}))
-        self.assertNotIn("actions", planned)
+        self.assertEqual([action["kind"] for action in planned["actions"]], ["git_rules", "git_rules"])
         self.assertTrue(any("remote add origin" in step for step in planned["manual_steps"]))
         bare = self.hub()
         planned = devices.public_plan(devices.plan(vault, state, {"level": "computers", "remote": str(bare)}))
-        self.assertEqual([action["kind"] for action in planned["actions"]], ["set_remote"])
+        self.assertEqual([action["kind"] for action in planned["actions"]], ["git_rules", "git_rules", "set_remote"])
         self.assertEqual(list(state.iterdir()), [])
         applied = devices.apply(vault, state, {"level": "computers", "remote": str(bare)})
         self.assertEqual(applied["status"], "applied")
         self.assertEqual(git(vault, "remote", "get-url", "origin"), str(bare))
         self.assertEqual((devices.status(vault, state)["level"], devices.status(vault, state)["git_dir"]), ("computers", None))
-        self.assertEqual(self.tree(vault), before)
+        outside_git = lambda: [path for path in self.tree(vault) if not path.startswith(".git")]
+        self.assertEqual(outside_git(), [])
+        self.assertIn("beyin.py", (vault / ".git/info/exclude").read_text(encoding="utf-8"))
         self.assertEqual(devices.apply(vault, state, {"level": "computers", "remote": str(bare)})["status"], "unchanged")
         shown = devices.doctor(state)
         self.assertEqual((shown["enabled"], shown["level"], shown["git_dir"]), (True, "computers", None))
@@ -460,7 +462,8 @@ class ComputersLevelTest(Base):
         bare = self.hub()
         options.update(git_dir=str(git_dir), remote=str(bare))
         planned = devices.public_plan(devices.plan(vault, state, options))
-        self.assertEqual([action["kind"] for action in planned["actions"]], ["init_git_dir", "set_remote"])
+        self.assertEqual([action["kind"] for action in planned["actions"]],
+                         ["init_git_dir", "git_rules", "git_rules", "set_remote"])
         self.assertFalse(git_dir.exists())
         self.assertEqual(list(state.iterdir()), [])
         before = self.tree(vault)
@@ -533,6 +536,101 @@ class ComputersLevelTest(Base):
 
 
 
+class MachineFilesTest(Base):
+    # Installation files carry one machine's paths (docs/v3/MULTI-MACHINE.md: every machine installs
+    # Beyin itself). Git keeps them out through the git directory's info/exclude and info/attributes,
+    # so nothing is written into the vault; the managed block keeps the user's own lines byte for byte.
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_rules_live_in_the_external_git_directory_not_in_the_vault(self):
+        vault = self.home / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+        vault.mkdir(parents=True)
+        (vault / "beyin.py").write_text("# machine\n", encoding="utf-8")
+        state = self.tmp / "state"
+        state.mkdir()
+        git_dir = self.tmp / "git" / "notes.git"
+        options = {"level": "computers", "phone_sync": "icloud", "git_dir": str(git_dir)}
+        planned = devices.public_plan(devices.plan(vault, state, options))
+        self.assertNotIn("content", json.dumps(planned))
+        before = self.tree(vault)
+        self.assertEqual(devices.apply(vault, state, options)["status"], "applied")
+        self.assertEqual(self.tree(vault), before)
+        exclude = (git_dir / "info/exclude").read_text(encoding="utf-8")
+        self.assertIn(devices.BLOCK_START + "\n", exclude)
+        self.assertIn("\nbeyin.py\n", exclude)
+        self.assertIn("receipts/** -text", (git_dir / "info/attributes").read_text(encoding="utf-8"))
+        self.assertEqual(git(vault, "--git-dir=" + str(git_dir), "--work-tree=" + str(vault), "check-ignore", "beyin.py"),
+                         "beyin.py")
+        self.assertEqual(devices.apply(vault, state, options)["status"], "unchanged")
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_lines_outside_the_managed_block_keep_their_bytes(self):
+        vault, state = self.machine()
+        git(vault, "init", "-q", "-b", "main")
+        exclude = vault / ".git/info/exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        prefix = b"# comment\r\nkeep/\r\n\r\n"
+        suffix = "# Arşiv".encode("utf-8")
+        exclude.write_bytes(prefix + devices.BLOCK_START.encode() + b"\r\nold/\r\n" +
+                            devices.BLOCK_END.encode() + b"\r\n" + suffix)
+        self.assertEqual(devices.apply(vault, state, {"level": "computers"})["status"], "applied")
+        after = exclude.read_bytes()
+        self.assertTrue(after.startswith(prefix), after)
+        self.assertTrue(after.endswith(suffix), after)
+        self.assertIn(b"\r\n.beyin-runtime.json\r\n", after)
+        self.assertNotIn(b"old/", after)
+        self.assertFalse((vault / ".gitignore").exists())
+
+    def test_managed_block_is_idempotent_and_keeps_user_lines(self):
+        user = "# mine\nsecret/\n.beyin-version\n"
+        once = devices._merged_block(user, ["beyin.py", ".beyin-version", "daily/v3/"])
+        self.assertTrue(once.startswith(user))
+        self.assertEqual(once.count(".beyin-version"), 1)
+        self.assertEqual(devices._merged_block(once, ["beyin.py", ".beyin-version", "daily/v3/"]), once)
+        shrunk = devices._merged_block(once, ["beyin.py"])
+        self.assertNotIn("daily/v3/", shrunk)
+        self.assertIn("secret/", shrunk)
+        self.assertEqual(devices._merged_block("a\r\nb\r\n", ["c"]).count("\r\n"), 6)
+        self.assertEqual(devices._merged_block("keep\n", ["keep"]), "keep\n")
+        with self.assertRaisesRegex(devices.DevicesError, "managed block"):
+            devices._merged_block(devices.BLOCK_START + "\nkeep/\n", ["wanted/"])
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_an_unclosed_block_stops_apply_before_any_change(self):
+        vault, state = self.machine()
+        git(vault, "init", "-q", "-b", "main")
+        (vault / ".git/info").mkdir(exist_ok=True)
+        (vault / ".git/info/exclude").write_text(devices.BLOCK_START + "\nmine/\n", encoding="utf-8")
+        with self.assertRaisesRegex(devices.DevicesError, "managed block.*info/exclude"):
+            devices.plan(vault, state, {"level": "computers"})
+        self.assertEqual(list(state.iterdir()), [])
+
+    def test_user_files_in_the_scripts_folder_are_not_ignored(self):
+        vault, _ = self.machine()
+        scripts = vault / ".claude/scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "beyin_v3_sync.py").write_text("", encoding="utf-8")
+        self.assertIn(".claude/scripts/", devices._ignore_lines(vault)[0])
+        (scripts / "kendi-senkron.py").write_text("", encoding="utf-8")
+        lines, foreign = devices._ignore_lines(vault)
+        self.assertEqual(foreign, ["kendi-senkron.py"])
+        self.assertNotIn(".claude/scripts/", lines)
+        self.assertIn(".claude/scripts/beyin_v3*.py", lines)
+        planned = devices.plan(vault, self.machine("b")[1], {"level": "computers", "git_dir": str(self.tmp / "g.git")})
+        self.assertTrue(any("kendi-senkron.py" in warning for warning in planned["warnings"]))
+
+    @unittest.skipUnless(GIT, "git is required")
+    def test_already_tracked_machine_files_are_reported_not_untracked(self):
+        vault, state = self.machine()
+        git(vault, "init", "-q", "-b", "main")
+        (vault / "beyin.py").write_text("# machine\n", encoding="utf-8")
+        git(vault, "add", "beyin.py")
+        planned = devices.plan(vault, state, {"level": "computers"})
+        self.assertTrue(any("already tracks" in warning and "beyin.py" in warning for warning in planned["warnings"]))
+        devices.apply(vault, state, {"level": "computers"})
+        self.assertEqual(git(vault, "ls-files"), "beyin.py")
+
+
 @unittest.skipUnless(GIT, "git is required")
 class SyncRoundTest(Base):
     # Machine A keeps the vault in iCloud (the bridge, external git directory); machine B is a
@@ -549,6 +647,9 @@ class SyncRoundTest(Base):
         self.a = self.home / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
         (self.a / "notes").mkdir(parents=True)
         (self.a / "notes/one.md").write_text("# One\n", encoding="utf-8")
+        for name in ("beyin.py", ".beyin-runtime.json", ".claude/scripts/beyin_v3_sync.py", "daily/v3/2026-11-23.md"):
+            (self.a / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.a / name).write_text("machine a\n", encoding="utf-8")
         self.a_state = self.tmp / "a-state"
         self.a_state.mkdir()
         self.a_git = self.tmp / "a-git" / "notes.git"
@@ -571,8 +672,10 @@ class SyncRoundTest(Base):
         self.assertEqual(devices.status(self.a, self.a_state)["last_sync"]["status"], "ok")
 
     def test_changes_travel_both_ways_between_the_bridge_and_a_plain_computer(self):
+        (self.b / "beyin.py").write_text("machine b\n", encoding="utf-8")
         joined = devices.sync_once(self.b, self.b_state)
         self.assertEqual((joined["status"], joined["pulled"]), ("ok", True), joined)
+        self.assertEqual((self.b / "beyin.py").read_text(encoding="utf-8"), "machine b\n")
         self.assertEqual((self.b / "notes/one.md").read_text(encoding="utf-8"), "# One\n")
         (self.b / "notes/two.md").write_text("# Two\n", encoding="utf-8")
         sent = devices.sync_once(self.b, self.b_state)
@@ -581,6 +684,8 @@ class SyncRoundTest(Base):
         self.assertEqual((received["status"], received["pulled"], received["pushed"]), ("ok", True, False), received)
         self.assertTrue((self.a / "notes/two.md").exists())
         self.assertFalse((self.a / ".git").exists())
+        self.assertEqual(git(self.bare, "ls-tree", "-r", "--name-only", "main").splitlines(),
+                         ["notes/one.md", "notes/two.md"])
         idle = devices.sync_once(self.a, self.a_state)
         self.assertEqual((idle["status"], idle["committed"], idle["pulled"], idle["pushed"]), ("ok", False, False, False))
 

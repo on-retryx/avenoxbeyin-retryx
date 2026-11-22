@@ -19,7 +19,9 @@ Rules this module keeps:
 
 - `--detect` and `--plan` write nothing and make no network call. `--apply` writes the settings
   file in the machine-local runtime state and, at the computers level, git metadata (a git
-  directory outside the vault, a remote URL); it never writes into the vault. `--sync-once`
+  directory outside the vault, a remote URL, and a managed block in the git directory's
+  info/exclude and info/attributes that keeps each machine's installation files out of git);
+  it never writes into the vault. `--sync-once`
   talks to the configured remote: that is its whole purpose.
 - A rebase that stops on a conflict is aborted, so the working tree (which a phone may be reading
   through a file sync service) never carries conflict markers. Local commits stay; the conflict
@@ -50,6 +52,31 @@ GIT_TIMEOUT = 20
 NETWORK_TIMEOUT = 180
 OFF_MESSAGE = 'devices sync is off; choose a level with: devices --apply --level computers'
 DOC = 'docs/v3/DEVICES.md'
+BLOCK_START = '# >>> beyin devices (managed block)'
+BLOCK_END = '# <<< beyin devices'
+# docs/v3/MULTI-MACHINE.md: every machine installs and updates Beyin itself, so these files carry one
+# machine's paths and stay out of git. They go into the git directory's info/exclude, not a .gitignore
+# in the vault: nothing is written into a vault that a file sync service carries to a phone.
+GITIGNORE_LINES = (
+    '.beyin-runtime.json', '.beyin-version', 'beyin.py', 'Beyni Guncelle.cmd',
+    'Beyni Güncelle.command', 'Beyni Güncelle.sh', 'Beyni Güncelle.desktop', '.pi/extensions/beyin-v3.ts',
+    '.claude/settings.local.json', '.claude/scripts/', '.claude/hermes-plugin/',
+    '.claude/skills/beyin/', '.claude/skills/beyin-doktor/', '.claude/skills/beyin-guncelle/',
+    '.claude/skills/beyin-kontrol/', '.agents/hooks.json', '.agents/skills/beyin/',
+    '.agents/skills/beyin-doktor/', '.agents/skills/beyin-guncelle/', '.agents/skills/beyin-kontrol/',
+    '.codex/config.toml', '.codex/hooks.json', '.kiro/hooks/beyin-v3.json', '.kiro/skills/beyin/',
+    '.kiro/skills/beyin-doktor/', '.kiro/skills/beyin-guncelle/', '.kiro/skills/beyin-kontrol/',
+    '.opencode/plugins/beyin-v3.js', '.omp/hooks/pre/beyin-v3.ts', '**/.beyin-compact.lock',
+    '.beyin-note-write/', 'daily/v3/', 'knowledge/v3/', '.DS_Store',
+    '.obsidian/workspace*.json',
+)
+# When the user keeps their own files in .claude/scripts the whole folder must not be ignored.
+SCRIPTS_DIR_LINE = '.claude/scripts/'
+SCRIPTS_FILE_LINES = ('.claude/scripts/beyin_v3*.py', '.claude/scripts/compile.py',
+                      '.claude/scripts/flush.py', '.claude/scripts/__pycache__/')
+GITATTRIBUTES_LINES = ('receipts/** -text', '**/Last-Session.md merge=union',
+                       '**/Journal.md merge=union', '**/Arşiv/*.md merge=union')
+RULE_FILES = (('exclude', 'ignore'), ('attributes', 'attributes'))
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,63}')
 BRIDGE_REFUSAL = ('This vault is in a file sync folder. Git sync runs only on the one computer that keeps the '
                   'vault\'s git directory outside the synced folder; register it there with --git-dir PATH. '
@@ -360,16 +387,21 @@ def plan(vault, state, options):
                         'A file sync service carries it to other devices, where that path is wrong (see ' + DOC + ').')
     actions = []
     if settings['level'] == 'computers':
-        actions, steps = _computers_plan(vault, settings, options.get('remote'))
+        actions, steps, notes = _computers_plan(vault, settings, options.get('remote'))
         manual.extend(steps)
+        warnings.extend(notes)
     return {'level': settings['level'], 'phone_sync': choice, 'manual_steps': manual, 'warnings': warnings,
             'actions': actions, 'settings': settings, 'changes_settings': not valid or settings != stored}
 
 
 def public_plan(result):
     """The plan as shown to a person."""
-    return {key: value for key, value in result.items()
-            if key != 'settings' and not (key == 'actions' and not value)}
+    shown = {key: value for key, value in result.items()
+             if key != 'settings' and not (key == 'actions' and not value)}
+    if shown.get('actions'):
+        shown['actions'] = [{key: value for key, value in action.items() if key != 'lines'}
+                             for action in shown['actions']]
+    return shown
 
 
 def apply(vault, state, options):
@@ -404,7 +436,7 @@ def _remote_problem(vault, url):
 
 
 def _computers_plan(vault, settings, remote):
-    """Git steps for the computers level: (actions, manual steps). Reads local git only."""
+    """Git steps for the computers level: (actions, manual steps, warnings). Reads local git only."""
     vault = Path(vault).resolve()
     git_dir, actions, manual = settings['git_dir'], [], []
     if git_dir:
@@ -425,9 +457,12 @@ def _computers_plan(vault, settings, remote):
     elif not _git_facts(vault)['repository']:
         raise DevicesError('--level computers needs git: run `git init` in the vault, or keep the git directory '
                            'outside it with --git-dir PATH')
+    new_repository = bool(actions)
+    rules, notes = _rules_plan(vault, git_dir, new_repository)
+    actions.extend(rules)
     name = settings['remote_name']
     current = None
-    if not actions:
+    if not new_repository:
         done = _git(vault, 'remote', 'get-url', name, git_dir=git_dir)
         current = done.stdout.strip() if done.returncode == 0 else None
     if remote:
@@ -440,13 +475,123 @@ def _computers_plan(vault, settings, remote):
     elif not current:
         manual.append('Connect a private repository that every computer can reach: '
                       + git_command(vault, git_dir, 'remote', 'add', name, 'URL') + ' (or --remote URL).')
-    return actions, manual
+    return actions, manual, notes
+
+
+def _merged_block(existing, lines):
+    """Return the file text with the managed block holding every wanted line that is not
+    already present outside the block. The rest of the file is left byte for byte."""
+    newline = '\r\n' if '\r\n' in existing else '\n'
+    rows = existing.splitlines(keepends=True)
+    start = end = None
+    for index, row in enumerate(rows):
+        if row.strip() == BLOCK_START:
+            if start is not None:
+                raise DevicesError('Duplicate start marker in the managed block.')
+            start = index
+        elif row.strip() == BLOCK_END:
+            if start is None or end is not None:
+                raise DevicesError('Unexpected end marker in the managed block.')
+            end = index
+    if start is not None and end is None:
+        raise DevicesError('Missing end marker in the managed block.')
+    before = rows if start is None else rows[:start]
+    after = [] if end is None else rows[end + 1:]
+    kept_outside = {row.strip() for row in (*before, *after)}
+    wanted = [line for line in lines if line not in kept_outside]
+    prefix = ''.join(before)
+    if wanted and start is None and prefix:
+        if not prefix.endswith(('\r', '\n')):
+            prefix += newline
+        if before[-1].strip():
+            prefix += newline
+    block = newline.join((BLOCK_START, *wanted, BLOCK_END)) + newline if wanted else ''
+    return prefix + block + ''.join(after)
+
+
+def _ignore_lines(vault):
+    """The ignore lines for this vault, and the user's own files found in .claude/scripts."""
+    scripts = Path(vault) / '.claude/scripts'
+    foreign = []
+    if scripts.is_dir():
+        foreign = sorted(item.name for item in scripts.iterdir()
+                         if item.name != '__pycache__' and not item.name.startswith('.')
+                         and not re.fullmatch(r'beyin_v3(_[a-z]+)*\.py', item.name)
+                         and item.name not in ('compile.py', 'flush.py'))
+    if not foreign:
+        return list(GITIGNORE_LINES), []
+    lines = []
+    for line in GITIGNORE_LINES:
+        lines.extend(SCRIPTS_FILE_LINES if line == SCRIPTS_DIR_LINE else (line,))
+    return lines, foreign
+
+
+def _info_dir(vault, git_dir):
+    """The info folder of the repository Beyin uses: inside the registered external git directory,
+    or the ordinary .git folder (its common directory for a linked worktree)."""
+    if git_dir:
+        return Path(git_dir) / 'info'
+    done = _git(vault, 'rev-parse', '--git-common-dir')
+    found = done.stdout.strip()
+    if done.returncode != 0 or not found:
+        raise DevicesError('git could not open the repository: ' + _tail(done.stderr))
+    path = Path(found)
+    return (path if path.is_absolute() else Path(vault) / path).resolve() / 'info'
+
+
+def _read_raw(path):
+    try:
+        with open(path, encoding='utf-8', newline='') as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ''
+
+
+def _tracked_machine_files(vault, git_dir):
+    paths = [line.rstrip('/') for line in GITIGNORE_LINES if '*' not in line and line != '.DS_Store']
+    done = _git(vault, 'ls-files', '--', *paths, git_dir=git_dir, timeout=30)
+    return sorted(done.stdout.splitlines())[:40] if done.returncode == 0 else []
+
+
+def _rules_plan(vault, git_dir, new_repository):
+    """Managed-block updates for info/exclude and info/attributes, and warnings. Reads only."""
+    ignore, foreign = _ignore_lines(vault)
+    notes = []
+    if foreign:
+        notes.append('.claude/scripts holds your own files (' + ', '.join(foreign[:5]) + '); only Beyin engine '
+                     'files are kept out of git there.')
+    info = _info_dir(vault, git_dir)
+    actions = []
+    for name, kind in RULE_FILES:
+        lines = ignore if kind == 'ignore' else list(GITATTRIBUTES_LINES)
+        existing = '' if new_repository else _read_raw(info / name)
+        try:
+            merged = _merged_block(existing, lines)
+        except DevicesError as exc:
+            raise DevicesError(str(exc) + ' Fix it by hand in ' + str(info / name) + '.') from None
+        if merged != existing:
+            actions.append({'kind': 'git_rules', 'summary': 'keep machine files out of git: managed block in '
+                            + str(info / name), 'file': name, 'lines': lines})
+    if not new_repository:
+        tracked = _tracked_machine_files(vault, git_dir)
+        if tracked:
+            notes.append('Git already tracks machine-specific installation files: ' + ', '.join(tracked[:8]) +
+                         ('...' if len(tracked) > 8 else '') + '. Ignore rules do not untrack them; on one machine run ' +
+                         git_command(vault, git_dir, 'rm', '--cached', '-r', '--', *tracked[:8]) +
+                         ' and commit (the files stay on disk), see docs/v3/MULTI-MACHINE.md.')
+    return actions, notes
 
 
 def _execute(vault, settings, action):
     git_dir = settings['git_dir']
     if action['kind'] == 'init_git_dir':
         init_external_git(vault, git_dir, settings['branch'])
+    elif action['kind'] == 'git_rules':
+        # Merged again against the file as it is now: `git init` may have just written a template.
+        path = _info_dir(vault, git_dir) / action['file']
+        merged = _merged_block(_read_raw(path), action['lines'])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic(path, merged)
     elif action['kind'] == 'set_remote':
         done = _git(vault, 'remote', 'set-url' if action['replace'] else 'add', action['name'], action['url'],
                     git_dir=git_dir)
