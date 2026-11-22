@@ -532,5 +532,130 @@ class ComputersLevelTest(Base):
         self.assertIn("only valid with --plan or --apply", err)
 
 
+
+@unittest.skipUnless(GIT, "git is required")
+class SyncRoundTest(Base):
+    # Machine A keeps the vault in iCloud (the bridge, external git directory); machine B is a
+    # plain computer with an ordinary .git folder. Both share one bare remote.
+
+    def setUp(self):
+        super().setUp()
+        identity = mock.patch.dict(os.environ, {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"})
+        identity.start()
+        self.addCleanup(identity.stop)
+        self.bare = self.tmp / "hub.git"
+        git(self.tmp, "init", "-q", "--bare", "-b", "main", str(self.bare))
+        self.a = self.home / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+        (self.a / "notes").mkdir(parents=True)
+        (self.a / "notes/one.md").write_text("# One\n", encoding="utf-8")
+        self.a_state = self.tmp / "a-state"
+        self.a_state.mkdir()
+        self.a_git = self.tmp / "a-git" / "notes.git"
+        applied = devices.apply(self.a, self.a_state, {"level": "computers", "phone_sync": "icloud",
+                                                       "git_dir": str(self.a_git), "remote": str(self.bare)})
+        self.assertEqual(applied["status"], "applied", applied)
+        first = devices.sync_once(self.a, self.a_state)
+        self.assertEqual((first["status"], first["committed"], first["pushed"]), ("ok", True, True), first)
+        self.b, self.b_state = self.machine("b")
+        git(self.b, "init", "-q", "-b", "main")
+        self.assertEqual(devices.apply(self.b, self.b_state, {"level": "computers", "remote": str(self.bare)})["status"],
+                         "applied")
+
+    def test_the_bridge_syncs_without_writing_git_data_into_the_vault(self):
+        self.assertFalse((self.a / ".git").exists())
+        self.assertEqual(git(self.bare, "ls-tree", "-r", "--name-only", "main").splitlines(), ["notes/one.md"])
+        record = json.loads((self.a_state / devices.RECORD_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "ok")
+        self.assertIn("at", record)
+        self.assertEqual(devices.status(self.a, self.a_state)["last_sync"]["status"], "ok")
+
+    def test_changes_travel_both_ways_between_the_bridge_and_a_plain_computer(self):
+        joined = devices.sync_once(self.b, self.b_state)
+        self.assertEqual((joined["status"], joined["pulled"]), ("ok", True), joined)
+        self.assertEqual((self.b / "notes/one.md").read_text(encoding="utf-8"), "# One\n")
+        (self.b / "notes/two.md").write_text("# Two\n", encoding="utf-8")
+        sent = devices.sync_once(self.b, self.b_state)
+        self.assertEqual((sent["status"], sent["committed"], sent["pushed"]), ("ok", True, True), sent)
+        received = devices.sync_once(self.a, self.a_state)
+        self.assertEqual((received["status"], received["pulled"], received["pushed"]), ("ok", True, False), received)
+        self.assertTrue((self.a / "notes/two.md").exists())
+        self.assertFalse((self.a / ".git").exists())
+        idle = devices.sync_once(self.a, self.a_state)
+        self.assertEqual((idle["status"], idle["committed"], idle["pulled"], idle["pushed"]), ("ok", False, False, False))
+
+    def test_a_conflict_leaves_no_markers_and_prints_the_full_git_command(self):
+        devices.sync_once(self.b, self.b_state)
+        (self.a / "notes/one.md").write_text("# One from A\n", encoding="utf-8")
+        (self.b / "notes/one.md").write_text("# One from B\n", encoding="utf-8")
+        self.assertEqual(devices.sync_once(self.b, self.b_state)["status"], "ok")
+        result = devices.sync_once(self.a, self.a_state)
+        self.assertEqual(result["status"], "conflict", result)
+        self.assertEqual(result["conflicts"], ["notes/one.md"])
+        self.assertEqual((self.a / "notes/one.md").read_text(encoding="utf-8"), "# One from A\n")
+        self.assertIsNone(devices._in_progress(self.a_git))
+        self.assertFalse((self.a / ".git").exists())
+        command = result["resolve_command"]
+        self.assertEqual(command, devices.git_command(self.a, self.a_git, "pull", "--rebase", "origin", "main"))
+        self.assertIn("--git-dir=" + str(self.a_git), command)
+        self.assertIn("--work-tree=" + str(self.a), command)
+        self.assertIn(command, result["reason"])
+        self.assertEqual(devices.doctor(self.a_state)["last_sync"]["status"], "conflict")
+        self.assertIn("age_minutes", devices.doctor(self.a_state)["last_sync"])
+        # Resolved by hand (here: take the remote side); the next round goes through.
+        devices._git(self.a, "reset", "-q", "--hard", "origin/main", git_dir=self.a_git)
+        self.assertEqual(devices.sync_once(self.a, self.a_state)["status"], "ok")
+
+    def test_a_synced_vault_without_a_registered_git_directory_is_refused(self):
+        # A second Mac sees the same iCloud vault but is not the bridge.
+        other_state = self.tmp / "c-state"
+        other_state.mkdir()
+        (other_state / devices.SETTINGS_FILE).write_text(json.dumps(
+            {**devices.default_settings(), "level": "computers", "phone_sync": "icloud"}), encoding="utf-8")
+        with self.assertRaisesRegex(devices.DevicesError, "--git-dir PATH"):
+            devices.sync_once(self.a, other_state)
+        self.assertEqual(sorted(path.name for path in other_state.iterdir()), [devices.SETTINGS_FILE])
+
+    def test_refuses_while_off_and_writes_nothing(self):
+        vault, state = self.machine("c")
+        with self.assertRaisesRegex(devices.DevicesError, "devices sync is off"):
+            devices.sync_once(vault, state)
+        self.assertEqual(list(state.iterdir()), [])
+
+    def test_unreachable_remote_keeps_the_local_commit(self):
+        devices.sync_once(self.b, self.b_state)
+        git(self.b, "remote", "set-url", "origin", str(self.tmp / "missing.git"))
+        (self.b / "notes/offline.md").write_text("x\n", encoding="utf-8")
+        result = devices.sync_once(self.b, self.b_state)
+        self.assertEqual((result["status"], result["committed"]), ("offline", True))
+        self.assertEqual(git(self.b, "status", "--porcelain"), "")
+
+    def test_blocked_on_another_branch_or_an_open_merge(self):
+        devices._git(self.a, "checkout", "-q", "-b", "deneme", git_dir=self.a_git)
+        self.assertEqual(devices.sync_once(self.a, self.a_state)["status"], "blocked")
+        devices._git(self.a, "checkout", "-q", "main", git_dir=self.a_git)
+        (self.a_git / "MERGE_HEAD").write_text("0" * 40 + "\n", encoding="utf-8")
+        blocked = devices.sync_once(self.a, self.a_state)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn("--git-dir=" + str(self.a_git), blocked["reason"])
+
+    def test_overlapping_rounds_do_not_run_together(self):
+        with open(self.b_state / devices.LOCK_FILE, "a+b") as handle:
+            self.assertTrue(devices._lock(handle))
+            self.assertEqual(devices.sync_once(self.b, self.b_state), {"status": "already_running"})
+
+    def test_credentials_in_git_messages_are_redacted(self):
+        self.assertEqual(devices._tail("fatal: https://me:tok@example.com/x.git not found"),
+                         "fatal: https://example.com/x.git not found")
+
+    def test_cli_runs_one_round(self):
+        cli = CliTest(methodName="run_cli")
+        cli.home = self.home
+        (self.a / "notes/cli.md").write_text("cli\n", encoding="utf-8")
+        code, out, err = cli.run_cli(self.a, self.a_state, "devices", "--sync-once")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["status"], "ok")
+        self.assertIn("notes/cli.md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
+
 if __name__ == "__main__":
     unittest.main()

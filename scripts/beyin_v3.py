@@ -1265,6 +1265,7 @@ def parser(note_namespace=None, is_json=False):
     devices_action.add_argument("--detect", action="store_true", help="Describe this machine and the levels it is ready for; writes nothing")
     devices_action.add_argument("--plan", action="store_true", help="Show what --apply would store and the steps left to you; writes nothing")
     devices_action.add_argument("--apply", action="store_true", help="Store the chosen level in the runtime state; writes nothing in the vault")
+    devices_action.add_argument("--sync-once", action="store_true", help="computers: one round (commit, rebase onto the remote, push); never leaves conflict markers")
     devices.add_argument("--level", choices=["solo", "phone", "computers"], help="solo: one computer; phone: + phone or tablet via a file sync service; computers: several computers through a git remote")
     devices.add_argument("--phone-sync", choices=["icloud", "obsidian-sync", "other"], help="How the phone sees the vault")
     devices.add_argument("--git-dir", help="computers: absolute path of the vault's git directory, kept outside the vault (needed when the vault is in a file sync folder)")
@@ -2229,6 +2230,8 @@ def main(argv=None, return_result=False):
                 result = devices_mod.public_plan(devices_mod.plan(vault, state, options))
             elif args.apply:
                 result = devices_mod.apply(vault, state, options)
+            elif args.sync_once:
+                result = devices_mod.sync_once(vault, state)
             else:
                 result = devices_mod.status(vault, state)
         elif args.command == "context":

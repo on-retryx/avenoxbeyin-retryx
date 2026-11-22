@@ -10,7 +10,8 @@ installation is unchanged. Levels:
 - `computers` several computers share the vault through a git remote the user owns. A vault that
            a file sync service also carries keeps its git directory outside the vault, and only
            the computer that registered it (the bridge) runs git (see the section at the end).
-           This level prepares the repository and the remote; sync rounds come in a later step.
+           `--sync-once` runs one round: commit, rebase onto the remote, push. A scheduler comes in
+           a later step.
 
 An always-on hub is discussed in #205 and not exposed yet.
 
@@ -18,11 +19,16 @@ Rules this module keeps:
 
 - `--detect` and `--plan` write nothing and make no network call. `--apply` writes the settings
   file in the machine-local runtime state and, at the computers level, git metadata (a git
-  directory outside the vault, a remote URL); it never writes into the vault.
+  directory outside the vault, a remote URL); it never writes into the vault. `--sync-once`
+  talks to the configured remote: that is its whole purpose.
+- A rebase that stops on a conflict is aborted, so the working tree (which a phone may be reading
+  through a file sync service) never carries conflict markers. Local commits stay; the conflict
+  is reported with the exact git command to resolve it by hand.
 - Settings live in the runtime state, never in the vault, so they are not synchronised to a
   device they do not describe and a rollback to an older engine ignores them.
 - Standard library only.
 """
+import calendar
 import json
 import os
 from pathlib import Path
@@ -32,12 +38,17 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 
 SETTINGS_FILE = 'devices.json'
+RECORD_FILE = 'devices-sync.json'
+LOCK_FILE = 'devices-sync.lock'
 LEVELS = ('solo', 'phone', 'computers')
 PHONE_SYNCS = ('icloud', 'obsidian-sync', 'other')
 GIT_TIMEOUT = 20
+NETWORK_TIMEOUT = 180
+OFF_MESSAGE = 'devices sync is off; choose a level with: devices --apply --level computers'
 DOC = 'docs/v3/DEVICES.md'
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,63}')
 BRIDGE_REFUSAL = ('This vault is in a file sync folder. Git sync runs only on the one computer that keeps the '
@@ -116,20 +127,40 @@ def read_settings(state):
     return merged, True
 
 
+def _read_record(state):
+    try:
+        data = json.loads((Path(state) / RECORD_FILE).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def status(vault, state):
     settings, valid = read_settings(state)
-    return {'valid': valid, 'enabled': settings['level'] != 'solo', **settings}
+    result = {'valid': valid, 'enabled': settings['level'] != 'solo', **settings}
+    record = _read_record(state)
+    if record:
+        result['last_sync'] = record
+    return result
 
 
 def doctor(state):
     """Read-only line for doctor: only the switch while the feature is off."""
     settings, valid = read_settings(state)
-    if valid and settings['level'] == 'solo':
+    record = _read_record(state)
+    if valid and settings['level'] == 'solo' and not record:
         return {'enabled': False}
     result = {'enabled': settings['level'] != 'solo', 'valid': valid, 'level': settings['level'],
               'phone_sync': settings['phone_sync']}
     if settings['level'] == 'computers':
         result['git_dir'] = settings['git_dir']
+    if record:
+        result['last_sync'] = {key: record.get(key) for key in ('status', 'at', 'reason') if record.get(key) is not None}
+        try:
+            at = calendar.timegm(time.strptime(record.get('at', ''), '%Y-%m-%dT%H:%M:%SZ'))
+            result['last_sync']['age_minutes'] = max(0, int((time.time() - at) // 60))
+        except (TypeError, ValueError, OverflowError):
+            pass
     return result
 
 
@@ -147,6 +178,8 @@ def _git(vault, *args, git_dir=None, timeout=GIT_TIMEOUT):
         return subprocess.CompletedProcess(args, 127, '', 'git not found')
     env = dict(os.environ)
     env.update({'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C', 'LANGUAGE': 'C'})
+    # Never wait for a passphrase or a host key prompt in an unattended round.
+    env.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=20')
     for name in ('GIT_DIR', 'GIT_WORK_TREE'):  # only the explicit arguments decide the repository
         env.pop(name, None)
     argv = [exe, '-C', str(vault), *git_dir_args(vault, git_dir), '-c', 'core.quotePath=false', *args]
@@ -517,3 +550,136 @@ def bridge_git_dir(vault, state):
     if not is_git_dir(vault, registered):
         raise DevicesError('The registered git directory is missing or is not a git repository: ' + registered)
     return Path(registered)
+
+
+# ---------------------------------------------------------------- one sync round
+
+def _utc(seconds=None):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(seconds))
+
+
+def _redact(text):
+    """Drop credentials embedded in a URL before it is printed or stored."""
+    return re.sub(r'(?<=://)[^/@\s]+@', '', text or '')
+
+
+def _tail(text, limit=300):
+    return _redact((text or '').strip())[-limit:]
+
+
+def _lock(handle):
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _in_progress(git_dir):
+    for name, label in (('rebase-merge', 'rebase'), ('rebase-apply', 'rebase'), ('MERGE_HEAD', 'merge'),
+                        ('CHERRY_PICK_HEAD', 'cherry-pick'), ('BISECT_LOG', 'bisect')):
+        if (Path(git_dir) / name).exists():
+            return label
+    return None
+
+
+def _device_label():
+    return 'mac' if sys.platform == 'darwin' else 'windows' if sys.platform.startswith('win') else 'linux'
+
+
+def _round(vault, settings, git_dir):
+    """Commit local changes, rebase onto the remote branch, push. git_dir is the registered
+    external git directory, or None for an ordinary `.git` folder in an unsynced vault."""
+    remote, branch = settings['remote_name'], settings['branch']
+
+    def run(*args, timeout=GIT_TIMEOUT):
+        return _git(vault, *args, git_dir=git_dir, timeout=timeout)
+
+    if git_dir is None and not _git_facts(vault)['repository']:
+        return {'status': 'error', 'reason': 'the vault is not a git repository'}
+    found = run('rev-parse', '--absolute-git-dir')
+    if found.returncode != 0 or not found.stdout.strip():
+        return {'status': 'error', 'reason': 'git could not open the repository: ' + _tail(found.stderr)}
+    repository = Path(found.stdout.strip())
+    busy = _in_progress(repository)
+    if busy:
+        return {'status': 'blocked', 'reason': 'an unfinished ' + busy + ' is open; finish or abort it by hand: ' +
+                git_command(vault, git_dir, 'status')}
+    current = run('symbolic-ref', '--short', '-q', 'HEAD').stdout.strip()
+    if current != branch:
+        return {'status': 'blocked', 'reason': 'the vault is on branch "' + (current or 'detached HEAD') +
+                '", the sync branch is "' + branch + '"'}
+    done = run('add', '-A', timeout=NETWORK_TIMEOUT)
+    if done.returncode != 0:
+        return {'status': 'error', 'reason': 'git add failed: ' + _tail(done.stderr)}
+    committed = False
+    if run('diff', '--cached', '--quiet', timeout=60).returncode == 1:
+        done = run('commit', '-q', '-m', 'Beyin sync ' + _device_label() + ' ' + time.strftime('%Y-%m-%d %H:%M'),
+                   timeout=60)
+        if done.returncode != 0:
+            return {'status': 'error', 'reason': 'git commit failed (are user.name and user.email set?): ' +
+                    _tail(done.stderr)}
+        committed = True
+    done = run('fetch', '-q', remote, timeout=NETWORK_TIMEOUT)
+    if done.returncode != 0:
+        return {'status': 'offline', 'committed': committed,
+                'reason': 'could not reach remote "' + remote + '": ' + _tail(done.stderr)}
+    result = {'committed': committed, 'pulled': False, 'conflicts': []}
+    upstream = remote + '/' + branch
+    if run('rev-parse', '-q', '--verify', 'refs/remotes/' + upstream).returncode == 0:
+        if not run('rev-parse', '-q', '--verify', 'HEAD').stdout.strip():
+            done, incoming = run('merge', '-q', '--ff-only', upstream, timeout=60), True  # a new repository joins
+        else:
+            incoming = run('rev-list', '--count', 'HEAD..' + upstream).stdout.strip() not in ('', '0')
+            done = run('rebase', '--autostash', upstream, timeout=NETWORK_TIMEOUT) if incoming else None
+        if done is not None and done.returncode != 0:
+            conflicts = [line for line in run('diff', '--name-only', '--diff-filter=U').stdout.splitlines() if line]
+            if _in_progress(repository):
+                run('rebase', '--abort', timeout=60)
+            command = git_command(vault, git_dir, 'pull', '--rebase', remote, branch)
+            return {**result, 'status': 'conflict', 'conflicts': conflicts[:50], 'resolve_command': command,
+                    'reason': ('the same lines changed on two devices; local commits are kept and the remote changes '
+                               'were not applied. Resolve the listed files by hand, starting with: ' + command)
+                    if conflicts else 'could not apply remote changes: ' + _tail(done.stderr)}
+        result['pulled'] = incoming
+    head = run('rev-parse', '-q', '--verify', 'HEAD').stdout.strip()
+    if not head:
+        return {**result, 'status': 'ok', 'pushed': False, 'reason': 'nothing to synchronise yet'}
+    if run('rev-parse', '-q', '--verify', 'refs/remotes/' + upstream).stdout.strip() == head:
+        return {**result, 'status': 'ok', 'pushed': False, 'head': head[:12]}
+    done = run('push', '-q', '-u', remote, branch, timeout=NETWORK_TIMEOUT)
+    if done.returncode != 0:
+        return {**result, 'status': 'retry', 'pushed': False, 'head': head[:12],
+                'reason': 'push was not accepted (another device pushed first, or no write access): ' + _tail(done.stderr)}
+    return {**result, 'status': 'ok', 'pushed': True, 'head': head[:12]}
+
+
+def sync_once(vault, state):
+    """One round on this machine. Refuses, writing nothing, while the level has no git or when
+    this computer is not the bridge of a synced vault. Records the outcome in the runtime state."""
+    vault, state = Path(vault).resolve(), Path(state)
+    settings, valid = read_settings(state)
+    if not valid:
+        raise DevicesError(SETTINGS_FILE + ' in the runtime state is invalid; fix or remove it first')
+    if settings['level'] != 'computers':
+        raise DevicesError(OFF_MESSAGE)
+    git_dir = bridge_git_dir(vault, state)
+    state.mkdir(parents=True, exist_ok=True)
+    with open(state / LOCK_FILE, 'a+b') as handle:
+        if not _lock(handle):
+            return {'status': 'already_running'}
+        started = time.time()
+        try:
+            result = _round(vault, settings, git_dir)
+        except DevicesError as exc:
+            result = {'status': 'error', 'reason': str(exc)}
+        result['at'] = _utc(started)
+        result['seconds'] = round(time.time() - started, 1)
+        _atomic(state / RECORD_FILE, json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+        return result
