@@ -1200,3 +1200,19 @@ def remove_scheduler(vault, state, scheduler_dir=None, runner=None, home=None):
         settings.update({'scheduler': None, 'interval': 0})
         _atomic(Path(state) / SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=2) + '\n')
     return {'status': 'removed', 'scheduler': removed[0]['kind'], 'label': removed[0]['label']}
+
+
+def release_schedule(vault, state, scheduler_dir=None, runner=None, home=None):
+    """Remove this vault's recorded schedule when the engine that runs it goes away: a rollback to a
+    release without this module, or an uninstall. Left behind, it would call `devices --sync-once`
+    on an engine that rejects the command, every round. The level stays; files Beyin did not create
+    or that changed since are left alone. Never raises: None when there is nothing to release."""
+    try:
+        vault = Path(vault).resolve()
+        settings, valid = read_settings(state)
+        if not valid or not _recorded_schedules(vault, settings, _read_ownership(state)):
+            return None
+        result = remove_scheduler(vault, state, scheduler_dir=scheduler_dir, runner=runner, home=home)
+    except Exception as exc:
+        return {'status': 'failed', 'reason': _redact(str(exc))[:200]}
+    return {**result, 'next': 'after updating to a release with devices, run devices --apply with --interval again'}

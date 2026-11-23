@@ -1,5 +1,6 @@
 """Tests-first offline semver package update and recovery contract."""
 import hashlib
+from functools import partial
 import importlib.util
 import json
 import os
@@ -82,6 +83,81 @@ class OfflineUpdateTest(unittest.TestCase):
         self.assertEqual(snapshot(self.vault), before_vault)
         self.assertEqual(snapshot(self.state), before_state)
         self.assertEqual(self.version(), '3.0.0')
+
+    def _devices_schedule(self):
+        devices = self.module._devices_module()
+        folder = self.base / 'scheduler'
+        runner = lambda argv: (1, '') if argv[1] == 'print' else (0, '')
+        vault = self.vault.resolve()
+        spec = devices.scheduler_spec(vault, self.state, 15, kind='launchd', scheduler_dir=folder)
+        devices._install_scheduler(vault, self.state, spec, folder, runner, None)
+        settings = {**devices.default_settings(), 'level': 'computers', 'interval': 15,
+                    'scheduler': {'kind': 'launchd', 'label': spec['label']}}
+        (self.state / 'devices.json').write_text(json.dumps(settings), encoding='utf-8', newline='\n')
+        self.enterContext(patch.object(devices, 'release_schedule', partial(
+            devices.release_schedule, scheduler_dir=folder, runner=runner)))
+        self.enterContext(patch.object(self.module, '_devices_module', return_value=devices))
+        return Path(next(iter(spec['files']))), folder, runner
+
+    def test_rollback_to_engine_without_devices_removes_its_schedule(self):
+        # The schedule runs `beyin.py devices --sync-once`; an engine without the command fails every round.
+        self.module.update(self.vault, self.state, self.package)
+        record = self.state / 'last-update.json'
+        backup = json.loads(record.read_text(encoding='utf-8'))
+        name = '.claude/scripts/beyin_v3_devices.py'
+        entry = next(item for item in backup['operations'] if item['name'] == name)
+        entry['old'] = None  # as if the previous release did not ship the devices module
+        record.write_text(json.dumps(backup), encoding='utf-8')
+        unit, _, _ = self._devices_schedule()
+        rolled = self.module.rollback(self.vault, self.state)
+        self.assertEqual(rolled['status'], 'rolled_back')
+        self.assertFalse((self.vault / name).exists())
+        self.assertFalse(unit.exists())
+        self.assertEqual(rolled['devices_schedule']['status'], 'removed')
+        settings = json.loads((self.state / 'devices.json').read_text(encoding='utf-8'))
+        self.assertEqual((settings['scheduler'], settings['interval'], settings['level']), (None, 0, 'computers'))
+
+    def test_rollback_to_engine_with_devices_keeps_its_schedule(self):
+        self.module.update(self.vault, self.state, self.package)
+        unit, _, _ = self._devices_schedule()
+        rolled = self.module.rollback(self.vault, self.state)
+        self.assertEqual(rolled['status'], 'rolled_back')
+        self.assertTrue(unit.exists())
+        self.assertNotIn('devices_schedule', rolled)
+
+    def test_release_schedule_refuses_a_changed_file_and_never_raises(self):
+        unit, _, _ = self._devices_schedule()
+        devices = self.module._devices_module()
+        unit.write_text(unit.read_text(encoding='utf-8') + '<!-- user edit -->', encoding='utf-8')
+        released = devices.release_schedule(self.vault, self.state)
+        self.assertEqual(released['status'], 'failed')
+        self.assertIn('ownership', released['reason'].lower())
+        self.assertTrue(unit.exists())
+
+    def test_release_schedule_without_schedule_is_silent(self):
+        devices = self.module._devices_module()
+        self.assertIsNone(devices.release_schedule(self.vault, self.state))
+
+    def test_uninstall_removes_devices_schedule(self):
+        unit, folder, runner = self._devices_schedule()
+        spec = importlib.util.spec_from_file_location('devices_uninstall_test', ROOT / 'scripts/install_v3.py')
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        with patch.object(installer, 'release_devices_schedule', partial(
+                installer.release_devices_schedule, scheduler_dir=folder, runner=runner)):
+            result = installer.install(self.vault, self.state, uninstall=True)
+        self.assertEqual(result['devices_schedule']['status'], 'removed')
+        self.assertFalse(unit.exists())
+
+    def test_human_rollback_reports_ownership_refusal(self):
+        spec = importlib.util.spec_from_file_location('devices_entry_test', ROOT / 'scripts/beyin_entry.py')
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        result = {'status': 'rolled_back', 'version': '3.0.0',
+                  'devices_schedule': {'status': 'failed', 'reason': 'Scheduler ownership refused: changed file.'}}
+        shown = entry.human_result(result, 'rollback')
+        self.assertIn('Zamanlama kaldırılamadı', shown)
+        self.assertIn('changed file', shown)
 
     def test_update_idempotent_and_rollback_preserves_new_user_note(self):
         core = self.vault / '.claude/scripts/beyin_v3.py'
