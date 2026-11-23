@@ -196,13 +196,20 @@ def _eligibility(found):
         phone['icloud'].append('move the vault under iCloud Drive/Obsidian (see ' + DOC + ')')
     if not found['obsidian']['sync_plugin']:
         phone['obsidian-sync'].append('an Obsidian Sync subscription and the Sync core plugin turned on in this vault')
+    else:
+        # The core plugin can be on without a subscription, and core-plugins.json often travels
+        # with the vault to machines that never used Sync, so it is not proof of one.
+        phone['obsidian-sync'].append('an Obsidian Sync subscription (the Sync core plugin is on; '
+                                      'Beyin cannot see whether a subscription is active)')
     return {'solo': {'needs': []}, 'phone': {'needs_per_option': phone}}
 
 
 def _current_fit(found):
-    """What the environment already looks like, as a starting suggestion and nothing more."""
+    """What the environment already looks like, as a starting suggestion and nothing more.
+
+    The Sync core plugin flag alone does not pick obsidian-sync: it is not proof of a subscription
+    (see _eligibility), so it stays a need to confirm instead of a suggestion."""
     phone = ('icloud' if found['vault_in_obsidian_ios_folder'] else
-             'obsidian-sync' if found['obsidian']['sync_plugin'] else
              'other' if found['vault_sync_service'] or found['obsidian']['syncthing'] else None)
     return {'level': 'phone' if phone else 'solo', 'phone_sync': phone}
 

@@ -134,11 +134,25 @@ class DetectTest(Base):
     def test_current_fit_suggests_the_phone_option_already_in_use(self):
         vault, state = self.machine()
         (vault / ".obsidian").mkdir()
-        (vault / ".obsidian/core-plugins.json").write_text('{"sync": true}', encoding="utf-8")
-        self.assertEqual(devices.detect(vault, state)["current_fit"], {"level": "phone", "phone_sync": "obsidian-sync"})
-        (vault / ".obsidian/core-plugins.json").unlink()
         (vault / ".stfolder").mkdir()
         self.assertEqual(devices.detect(vault, state)["current_fit"], {"level": "phone", "phone_sync": "other"})
+
+    def test_sync_core_plugin_alone_is_not_taken_as_an_obsidian_sync_subscription(self):
+        # core-plugins.json travels with the vault (git, iCloud), so a server or a second
+        # computer sees the flag although Sync was never set up there.
+        vault, state = self.machine()
+        (vault / ".obsidian").mkdir()
+        (vault / ".obsidian/core-plugins.json").write_text('{"sync": true}', encoding="utf-8")
+        found = devices.detect(vault, state)
+        self.assertTrue(found["obsidian"]["sync_plugin"])
+        self.assertEqual(found["current_fit"], {"level": "solo", "phone_sync": None})
+        needs = found["levels"]["phone"]["needs_per_option"]["obsidian-sync"]
+        self.assertEqual(len(needs), 1)
+        self.assertIn("subscription", needs[0])
+        self.assertIn("cannot see", needs[0])
+        (vault / ".obsidian/core-plugins.json").write_text('{"sync": false}', encoding="utf-8")
+        needs = devices.detect(vault, state)["levels"]["phone"]["needs_per_option"]["obsidian-sync"]
+        self.assertIn("core plugin turned on", needs[0])
 
     @unittest.skipUnless(GIT, "git required")
     def test_detect_reports_the_git_directory_also_through_a_symlink(self):

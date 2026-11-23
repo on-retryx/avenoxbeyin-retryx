@@ -46,7 +46,9 @@ Windows'ta `python3` yerine `py -3` kullan.
 - `--detect` işletim sistemini, vault'un bir eşitleme klasöründe olup olmadığını, Obsidian ve
   Obsidian Sync izlerini ve vault bir git deposuysa git dizininin nerede olduğunu bildirir
   (uzak depolar okunmaz). `levels` alanı her kademe için eksikleri,
-  `current_fit` ortamın şu an neye benzediğini söyler.
+  `current_fit` ortamın şu an neye benzediğini söyler. Obsidian'ın Sync çekirdek eklentisinin
+  açık olması abonelik kanıtı sayılmaz (`core-plugins.json` vault ile başka makinelere de taşınır);
+  bu yüzden `obsidian-sync` önerilmez, `levels` altında doğrulaman gereken abonelik olarak görünür.
 - `--plan` çıktısında `manual_steps` senin elle yapman gerekenleri (vault'u taşımak, telefonda
   Obsidian'ı açmak gibi), `warnings` bilmen gereken riskleri listeler.
 - `--apply` yalnız seçilen kademeyi runtime state içindeki `devices.json` dosyasına yazar.
