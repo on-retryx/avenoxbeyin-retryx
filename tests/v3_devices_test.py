@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -632,7 +633,7 @@ class MachineFilesTest(Base):
 
 
 @unittest.skipUnless(GIT, "git is required")
-class SyncRoundTest(Base):
+class TwoComputers(Base):
     # Machine A keeps the vault in iCloud (the bridge, external git directory); machine B is a
     # plain computer with an ordinary .git folder. Both share one bare remote.
 
@@ -663,6 +664,8 @@ class SyncRoundTest(Base):
         self.assertEqual(devices.apply(self.b, self.b_state, {"level": "computers", "remote": str(self.bare)})["status"],
                          "applied")
 
+
+class SyncRoundTest(TwoComputers):
     def test_the_bridge_syncs_without_writing_git_data_into_the_vault(self):
         self.assertFalse((self.a / ".git").exists())
         self.assertEqual(git(self.bare, "ls-tree", "-r", "--name-only", "main").splitlines(), ["notes/one.md"])
@@ -762,8 +765,6 @@ class SyncRoundTest(Base):
         self.assertEqual(json.loads(out)["status"], "ok")
         self.assertIn("notes/cli.md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 def fake_scheduler(argv):
@@ -993,3 +994,109 @@ class SchedulerCliTest(Base):
         code, _, err = self.run_cli(vault, state, "devices", "--plan", "--level", "computers", "--interval", "2")
         self.assertEqual(code, 1)
         self.assertIn("5..1440", err)
+
+
+class OfflineRecoveryTest(TwoComputers):
+    # The two computers keep the vault on different paths (A: iCloud bridge with an external git
+    # directory, B: plain folder with .git). Each works offline, then both come back.
+
+    def go_offline(self):
+        missing = str(self.tmp / "unreachable.git")
+        devices._git(self.a, "remote", "set-url", "origin", missing, git_dir=self.a_git)
+        git(self.b, "remote", "set-url", "origin", missing)
+
+    def go_online(self):
+        devices._git(self.a, "remote", "set-url", "origin", str(self.bare), git_dir=self.a_git)
+        git(self.b, "remote", "set-url", "origin", str(self.bare))
+
+    def pasted_env(self):
+        return inherited_env(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_EDITOR="true")
+
+    def test_offline_edits_on_both_computers_meet_after_reconnecting(self):
+        self.assertEqual(devices.sync_once(self.b, self.b_state)["status"], "ok")
+        self.assertNotEqual(str(self.a), str(self.b))
+        self.go_offline()
+        (self.a / "notes/from-a.md").write_text("A offline\n", encoding="utf-8")
+        (self.b / "notes/from-b.md").write_text("B offline\n", encoding="utf-8")
+        for vault, state in ((self.a, self.a_state), (self.b, self.b_state)):
+            result = devices.sync_once(vault, state)
+            self.assertEqual((result["status"], result["committed"]), ("offline", True), result)
+            self.assertEqual(devices.doctor(state)["last_sync"]["status"], "offline")
+        # A second offline round has nothing new to commit and loses nothing.
+        self.assertEqual(devices.sync_once(self.a, self.a_state)["committed"], False)
+        self.go_online()
+        first = devices.sync_once(self.a, self.a_state)
+        self.assertEqual((first["status"], first["pushed"]), ("ok", True), first)
+        second = devices.sync_once(self.b, self.b_state)
+        self.assertEqual((second["status"], second["pulled"], second["pushed"]), ("ok", True, True), second)
+        third = devices.sync_once(self.a, self.a_state)
+        self.assertEqual((third["status"], third["pulled"]), ("ok", True), third)
+        expected = ["notes/from-a.md", "notes/from-b.md", "notes/one.md"]
+        self.assertEqual(git(self.bare, "ls-tree", "-r", "--name-only", "main").splitlines(), expected)
+        for vault in (self.a, self.b):
+            self.assertEqual((vault / "notes/from-a.md").read_text(encoding="utf-8"), "A offline\n")
+            self.assertEqual((vault / "notes/from-b.md").read_text(encoding="utf-8"), "B offline\n")
+        self.assertFalse((self.a / ".git").exists())
+        self.assertEqual(devices._git(self.a, "status", "--porcelain", git_dir=self.a_git).stdout, "")
+        self.assertEqual(git(self.b, "status", "--porcelain"), "")
+
+    def test_an_offline_conflict_is_recovered_with_the_printed_command(self):
+        self.assertEqual(devices.sync_once(self.b, self.b_state)["status"], "ok")
+        git(self.b, "remote", "set-url", "origin", str(self.tmp / "unreachable.git"))
+        (self.b / "notes/one.md").write_text("# One from B offline\n", encoding="utf-8")
+        self.assertEqual(devices.sync_once(self.b, self.b_state)["status"], "offline")
+        (self.a / "notes/one.md").write_text("# One from A\n", encoding="utf-8")
+        self.assertEqual(devices.sync_once(self.a, self.a_state)["pushed"], True)
+        git(self.b, "remote", "set-url", "origin", str(self.bare))
+        local = git(self.b, "rev-parse", "HEAD")
+        result = devices.sync_once(self.b, self.b_state)
+        self.assertEqual((result["status"], result["conflicts"]), ("conflict", ["notes/one.md"]), result)
+        # Nothing is lost or half-applied: the offline commit stays, no markers, no open rebase.
+        self.assertEqual(git(self.b, "rev-parse", "HEAD"), local)
+        self.assertEqual((self.b / "notes/one.md").read_text(encoding="utf-8"), "# One from B offline\n")
+        self.assertIsNone(devices._in_progress(self.b / ".git"))
+        self.assertEqual(git(self.b, "status", "--porcelain"), "")
+        # The person pastes the printed command, edits the file, and finishes the rebase.
+        env = self.pasted_env()
+        pasted = subprocess.run(shlex.split(result["resolve_command"]), capture_output=True, text=True, env=env)
+        self.assertNotEqual(pasted.returncode, 0)
+        self.assertIn("<<<<<<<", (self.b / "notes/one.md").read_text(encoding="utf-8"))
+        (self.b / "notes/one.md").write_text("# One from A and B\n", encoding="utf-8")
+        git(self.b, "add", "notes/one.md")
+        subprocess.run([GIT, "-C", str(self.b), "rebase", "--continue"], check=True, capture_output=True, env=env)
+        resolved = devices.sync_once(self.b, self.b_state)
+        self.assertEqual((resolved["status"], resolved["pushed"]), ("ok", True), resolved)
+        back = devices.sync_once(self.a, self.a_state)
+        self.assertEqual((back["status"], back["pulled"]), ("ok", True), back)
+        self.assertEqual((self.a / "notes/one.md").read_text(encoding="utf-8"), "# One from A and B\n")
+        self.assertFalse((self.a / ".git").exists())
+
+    def test_the_bridge_recovers_a_conflict_through_its_external_git_directory(self):
+        self.assertEqual(devices.sync_once(self.b, self.b_state)["status"], "ok")
+        devices._git(self.a, "remote", "set-url", "origin", str(self.tmp / "unreachable.git"), git_dir=self.a_git)
+        (self.a / "notes/one.md").write_text("# One from A offline\n", encoding="utf-8")
+        self.assertEqual(devices.sync_once(self.a, self.a_state)["status"], "offline")
+        (self.b / "notes/one.md").write_text("# One from B\n", encoding="utf-8")
+        self.assertEqual(devices.sync_once(self.b, self.b_state)["pushed"], True)
+        devices._git(self.a, "remote", "set-url", "origin", str(self.bare), git_dir=self.a_git)
+        result = devices.sync_once(self.a, self.a_state)
+        self.assertEqual(result["status"], "conflict", result)
+        env = self.pasted_env()
+        # Pasted from another folder: the command carries --git-dir and --work-tree itself.
+        command = shlex.split(result["resolve_command"])
+        self.assertEqual(command[-4:], ["pull", "--rebase", "origin", "main"])
+        pasted = subprocess.run(command, capture_output=True, text=True, env=env, cwd=str(self.tmp))
+        self.assertNotEqual(pasted.returncode, 0)
+        self.assertIn("<<<<<<<", (self.a / "notes/one.md").read_text(encoding="utf-8"))
+        self.assertFalse((self.a / ".git").exists())
+        (self.a / "notes/one.md").write_text("# One merged\n", encoding="utf-8")
+        for args in (["add", "notes/one.md"], ["rebase", "--continue"]):
+            subprocess.run(command[:-4] + args, check=True, capture_output=True, env=env, cwd=str(self.tmp))
+        self.assertEqual(devices.sync_once(self.a, self.a_state)["status"], "ok")
+        self.assertEqual(devices.sync_once(self.b, self.b_state)["pulled"], True)
+        self.assertEqual((self.b / "notes/one.md").read_text(encoding="utf-8"), "# One merged\n")
+        self.assertFalse((self.a / ".git").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
