@@ -764,3 +764,232 @@ class SyncRoundTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def fake_scheduler(argv):
+    """Stands in for launchctl, systemctl and schtasks: nothing is registered yet, loads succeed."""
+    if argv[:2] in (["launchctl", "print"], ["schtasks", "/Query"]):
+        return 1, ""
+    if "--property=LoadState" in argv:
+        return 0, "not-found"
+    return 0, ""
+
+
+class SchedulerSpecTest(Base):
+    """What a scheduled round looks like on each platform; nothing is registered."""
+
+    def spec(self, kind, interval=15):
+        return devices.scheduler_spec(self.tmp / "v", self.tmp / "s", interval, kind=kind, home=self.home,
+                                      command=["/usr/bin/python3", "/v a/beyin.py", "devices", "--sync-once"])
+
+    def test_launchd_plist(self):
+        import plistlib
+        spec = self.spec("launchd")
+        (path, content), = spec["files"].items()
+        data = plistlib.loads(content.encode("utf-8"))
+        self.assertEqual((data["StartInterval"], data["ProgramArguments"][-1]), (900, "--sync-once"))
+        self.assertTrue(path.startswith(str(self.home / "Library/LaunchAgents")))
+        self.assertIn(spec["label"], path)
+
+    def test_systemd_units_quote_arguments(self):
+        spec = self.spec("systemd-user", 30)
+        service = next(v for k, v in spec["files"].items() if k.endswith(".service"))
+        timer = next(v for k, v in spec["files"].items() if k.endswith(".timer"))
+        self.assertIn('ExecStart="/usr/bin/python3" "/v a/beyin.py" "devices" "--sync-once"', service)
+        self.assertIn("OnUnitActiveSec=30min", timer)
+
+    def test_windows_task_and_fallbacks(self):
+        spec = self.spec("schtasks")
+        self.assertEqual(spec["load"][0][:2], ["schtasks", "/Create"])
+        self.assertIn('"/v a/beyin.py"', spec["load"][0][-1])
+        self.assertIn("*/15 * * * *", self.spec("cron")["manual"])
+        self.assertIn("sleep 900", self.spec("none")["manual"])
+        self.assertEqual(self.spec("none")["files"], {})
+
+    def test_scheduler_kind_per_platform(self):
+        self.assertEqual(devices.scheduler_kind("darwin"), "launchd")
+        self.assertEqual(devices.scheduler_kind("win32"), "schtasks")
+        with mock.patch.object(devices.shutil, "which", return_value=None):
+            self.assertEqual(devices.scheduler_kind("linux", {}), "none")
+
+    def test_two_install_paths_get_their_own_label(self):
+        first = devices.scheduler_spec(self.tmp / "a/vault", self.tmp / "a/state", 15, kind="launchd", home=self.home)
+        second = devices.scheduler_spec(self.tmp / "Users/b/Notlar Ölçüm", self.tmp / "b/state", 15, kind="launchd",
+                                        home=self.home)
+        self.assertNotEqual(first["label"], second["label"])
+        self.assertNotEqual(set(first["files"]), set(second["files"]))
+
+
+@unittest.skipUnless(GIT, "git is required")
+class SchedulerTest(Base):
+    """Install, record and remove the sync schedule. Scheduler files go to a temporary folder and
+    the load commands are stubbed: no real scheduler is touched."""
+
+    def setUp(self):
+        super().setUp()
+        self.scheduler_dir = self.tmp / "Scheduler Ölçüm"
+        self.bare = self.tmp / "hub.git"
+        git(self.tmp, "init", "-q", "--bare", str(self.bare))
+
+    def git_machine(self, name="a"):
+        vault, state = self.machine(name)
+        git(vault, "init", "-q", "-b", "main")
+        return vault, state
+
+    def apply(self, vault, state, runner=fake_scheduler, **options):
+        return devices.apply(vault, state, {"level": "computers", "remote": str(self.bare), **options},
+                             home=self.home, scheduler_dir=self.scheduler_dir, runner=runner)
+
+    def test_schedule_is_installed_recorded_repeated_and_removed(self):
+        vault, state = self.git_machine()
+        with mock.patch.object(devices, "scheduler_kind", return_value="systemd-user"):
+            result = self.apply(vault, state, interval=15)
+            self.assertEqual(result["status"], "applied", result)
+            units = sorted(self.scheduler_dir.iterdir())
+            self.assertEqual([path.suffix for path in units], [".service", ".timer"])
+            stored = devices.status(vault, state)
+            self.assertEqual((stored["interval"], stored["scheduler"]["kind"]), (15, "systemd-user"))
+            self.assertEqual(devices.doctor(state)["interval"], 15)
+            run = mock.Mock(return_value=(0, ""))
+            repeated = self.apply(vault, state, runner=run, interval=15)
+            self.assertEqual(repeated["status"], "unchanged", repeated)
+            run.assert_not_called()
+            content = units[0].read_bytes()
+            units[0].write_bytes(content + b"# changed\n")
+            with self.assertRaisesRegex(ValueError, "changed file"):
+                devices.remove_scheduler(vault, state, scheduler_dir=self.scheduler_dir, runner=run)
+            run.assert_not_called()
+            units[0].write_bytes(content)
+            removed = devices.remove_scheduler(vault, state, scheduler_dir=self.scheduler_dir, runner=run)
+            self.assertEqual(removed["status"], "removed")
+            self.assertEqual(run.call_args_list[0].args[0][:4], ["systemctl", "--user", "disable", "--now"])
+        self.assertEqual(list(self.scheduler_dir.iterdir()), [])
+        self.assertEqual((devices.status(vault, state)["interval"], devices.status(vault, state)["scheduler"]), (0, None))
+        self.assertEqual(devices.remove_scheduler(vault, state, scheduler_dir=self.scheduler_dir)["status"], "unchanged")
+
+    def test_a_new_interval_replaces_the_schedule_and_solo_removes_it(self):
+        vault, state = self.git_machine()
+        with mock.patch.object(devices, "scheduler_kind", return_value="launchd"):
+            self.apply(vault, state, interval=15)
+            self.assertEqual(self.apply(vault, state, interval=30)["status"], "applied")
+            import plistlib
+            plist, = self.scheduler_dir.iterdir()
+            self.assertEqual(plistlib.loads(plist.read_bytes())["StartInterval"], 1800)
+            run = mock.Mock(side_effect=fake_scheduler)
+            result = devices.apply(vault, state, {"level": "solo"}, home=self.home,
+                                   scheduler_dir=self.scheduler_dir, runner=run)
+            self.assertEqual(result["status"], "applied", result)
+            self.assertEqual(run.call_args_list[0].args[0][:2], ["launchctl", "bootout"])
+        self.assertEqual(list(self.scheduler_dir.iterdir()), [])
+        self.assertEqual(devices._read_ownership(state), {})
+
+    def test_two_computers_on_different_paths_keep_separate_schedules(self):
+        a, a_state = self.git_machine("a")
+        b, b_state = self.git_machine("Users/b/Notlar Ölçüm")
+        with mock.patch.object(devices, "scheduler_kind", return_value="launchd"):
+            self.apply(a, a_state, interval=15)
+            self.apply(b, b_state, interval=20)
+            self.assertEqual(len(list(self.scheduler_dir.iterdir())), 2)
+            devices.remove_scheduler(a, a_state, scheduler_dir=self.scheduler_dir, runner=fake_scheduler)
+        left, = self.scheduler_dir.iterdir()
+        self.assertIn(devices.status(b, b_state)["scheduler"]["label"], left.name)
+
+    def test_failed_load_keeps_settings_and_a_rerun_finishes(self):
+        vault, state = self.git_machine()
+        self.apply(vault, state)
+        before = (state / devices.SETTINGS_FILE).read_text(encoding="utf-8")
+        failing = lambda argv: (1, "Failed to connect to bus") if "enable" in argv else fake_scheduler(argv)
+        with mock.patch.object(devices, "scheduler_kind", return_value="systemd-user"):
+            with self.assertRaisesRegex(ValueError, "Failed to connect to bus"):
+                self.apply(vault, state, runner=failing, interval=15)
+            self.assertEqual((state / devices.SETTINGS_FILE).read_text(encoding="utf-8"), before)
+            self.assertFalse(next(iter(devices._read_ownership(state).values()))["active"])
+            self.assertEqual(self.apply(vault, state, interval=15)["status"], "applied")
+        self.assertTrue(next(iter(devices._read_ownership(state).values()))["active"])
+
+    def test_a_file_with_our_name_but_no_ownership_record_is_left_alone(self):
+        vault, state = self.git_machine()
+        spec = devices.scheduler_spec(vault, state, 15, kind="launchd", scheduler_dir=self.scheduler_dir)
+        (path, content), = spec["files"].items()
+        Path(path).parent.mkdir(parents=True)
+        Path(path).write_text(content, encoding="utf-8")
+        run = mock.Mock()
+        with mock.patch.object(devices, "scheduler_kind", return_value="launchd"), \
+                self.assertRaisesRegex(ValueError, "already exists"):
+            self.apply(vault, state, runner=run, interval=15)
+        run.assert_not_called()
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), content)
+
+    def test_invalid_labels_are_refused_before_any_path_or_command(self):
+        vault, state = self.machine()
+        run = mock.Mock()
+        for label in ("", "beyin-devices-İstanbul", "beyin-devices-a b", "beyin-devices-../abc"):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "invalid label"):
+                devices._scheduler_paths(vault, state, "systemd-user", label, self.scheduler_dir)
+        run.assert_not_called()
+        self.assertFalse(self.scheduler_dir.exists())
+
+    def test_windows_refuses_to_delete_a_replaced_task(self):
+        vault, state = self.machine()
+        spec = devices.scheduler_spec(vault, state, 15, kind="schtasks", scheduler_dir=self.scheduler_dir)
+        runner = mock.Mock(side_effect=[(1, ""), (0, ""), (0, "<Task>ours</Task>")])
+        devices._install_scheduler(vault, state, spec, self.scheduler_dir, runner, self.home)
+        (state / devices.SETTINGS_FILE).write_text(json.dumps({
+            **devices.default_settings(), "level": "computers", "interval": 15,
+            "scheduler": {"kind": "schtasks", "label": spec["label"]}}), encoding="utf-8")
+        path = Path(next(iter(spec["files"])))
+        runner.reset_mock(side_effect=True)
+        runner.return_value = (0, "<Task>replacement</Task>")
+        with self.assertRaisesRegex(ValueError, "task definition changed"):
+            devices.remove_scheduler(vault, state, scheduler_dir=self.scheduler_dir, runner=runner)
+        runner.assert_called_once_with(["schtasks", "/Query", "/TN", spec["label"], "/XML"])
+        self.assertTrue(path.exists())
+        runner.reset_mock()
+        runner.return_value = (0, "<Task>ours</Task>")
+        self.assertEqual(devices.remove_scheduler(vault, state, scheduler_dir=self.scheduler_dir, runner=runner)["status"], "removed")
+        self.assertIn(mock.call(["schtasks", "/Delete", "/F", "/TN", spec["label"]]), runner.call_args_list)
+        self.assertFalse(path.exists())
+
+    def test_interval_rules(self):
+        vault, state = self.git_machine()
+        for options, message in (({"level": "phone", "phone_sync": "icloud", "interval": 15}, "--interval belongs"),
+                                 ({"level": "computers", "interval": 2}, "0 \\(off\\) or 5..1440"),
+                                 ({"level": "computers", "interval": True}, "0 \\(off\\) or 5..1440")):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):
+                devices.plan(vault, state, options)
+        planned = devices.plan(vault, state, {"level": "computers"})
+        self.assertTrue(any("--interval 15" in step for step in planned["manual_steps"]))
+
+    def test_the_icloud_bridge_schedules_only_with_its_external_git_directory(self):
+        vault = self.home / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+        vault.mkdir(parents=True)
+        (vault / "note.md").write_text("# not\n", encoding="utf-8")
+        state = self.tmp / "state"
+        state.mkdir()
+        before = self.tree(vault)
+        with mock.patch.object(devices, "scheduler_kind", return_value="launchd"):
+            with self.assertRaisesRegex(ValueError, "git directory outside"):
+                devices.plan(vault, state, {"level": "computers", "phone_sync": "icloud", "interval": 15},
+                             home=self.home, scheduler_dir=self.scheduler_dir)
+            self.assertFalse(self.scheduler_dir.exists())
+            result = self.apply(vault, state, phone_sync="icloud", git_dir=str(self.tmp / "notes.git"), interval=15)
+        self.assertEqual(result["status"], "applied", result)
+        self.assertTrue(any("Full Disk Access" in warning for warning in result["warnings"]))
+        self.assertEqual(len(list(self.scheduler_dir.iterdir())), 1)
+        self.assertEqual(self.tree(vault), before)
+
+
+class SchedulerCliTest(Base):
+    run_cli = CliTest.run_cli
+
+    def test_interval_and_remove_schedule_options(self):
+        vault, state = self.machine()
+        code, _, err = self.run_cli(vault, state, "devices", "--interval", "15")
+        self.assertEqual(code, 1)
+        self.assertIn("only valid with --plan or --apply", err)
+        code, out, err = self.run_cli(vault, state, "devices", "--remove-schedule")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["status"], "unchanged")
+        code, _, err = self.run_cli(vault, state, "devices", "--plan", "--level", "computers", "--interval", "2")
+        self.assertEqual(code, 1)
+        self.assertIn("5..1440", err)

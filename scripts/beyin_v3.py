@@ -1276,10 +1276,12 @@ def parser(note_namespace=None, is_json=False):
     devices_action.add_argument("--plan", action="store_true", help="Show what --apply would store and the steps left to you; writes nothing")
     devices_action.add_argument("--apply", action="store_true", help="Store the chosen level in the runtime state; writes nothing in the vault")
     devices_action.add_argument("--sync-once", action="store_true", help="computers: one round (commit, rebase onto the remote, push); never leaves conflict markers")
+    devices_action.add_argument("--remove-schedule", action="store_true", help="computers: remove the sync schedule this command installed; the level stays")
     devices.add_argument("--level", choices=["solo", "phone", "computers"], help="solo: one computer; phone: + phone or tablet via a file sync service; computers: several computers through a git remote")
     devices.add_argument("--phone-sync", choices=["icloud", "obsidian-sync", "other"], help="How the phone sees the vault")
     devices.add_argument("--git-dir", help="computers: absolute path of the vault's git directory, kept outside the vault (needed when the vault is in a file sync folder)")
     devices.add_argument("--remote", help="computers: URL of the private repository the computers share")
+    devices.add_argument("--interval", type=int, help="computers: minutes between scheduled sync rounds (5..1440); 0 turns the schedule off")
     context = sub.add_parser("context", help="Retrieve source-backed shared context")
     context.add_argument("query", nargs="?", help="Query; alternatively use --file")
     context.add_argument("--file", help="JSON retrieval arguments, or - for stdin")
@@ -2298,7 +2300,8 @@ def main(argv=None, return_result=False):
         elif args.command == "devices":
             _ensure_scripts_path()
             import beyin_v3_devices as devices_mod
-            options = {"level": args.level, "phone_sync": args.phone_sync, "git_dir": args.git_dir, "remote": args.remote}
+            options = {"level": args.level, "phone_sync": args.phone_sync, "git_dir": args.git_dir, "remote": args.remote,
+                       "interval": args.interval}
             given = [name for name, value in options.items() if value is not None]
             if given and not (args.plan or args.apply):
                 raise ValueError("--" + given[0].replace("_", "-") + " is only valid with --plan or --apply")
@@ -2310,6 +2313,8 @@ def main(argv=None, return_result=False):
                 result = devices_mod.apply(vault, state, options)
             elif args.sync_once:
                 result = devices_mod.sync_once(vault, state)
+            elif args.remove_schedule:
+                result = devices_mod.remove_scheduler(vault, state)
             else:
                 result = devices_mod.status(vault, state)
         elif args.command == "context":

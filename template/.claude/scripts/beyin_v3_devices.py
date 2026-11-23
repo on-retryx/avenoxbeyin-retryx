@@ -10,8 +10,9 @@ installation is unchanged. Levels:
 - `computers` several computers share the vault through a git remote the user owns. A vault that
            a file sync service also carries keeps its git directory outside the vault, and only
            the computer that registered it (the bridge) runs git (see the section at the end).
-           `--sync-once` runs one round: commit, rebase onto the remote, push. A scheduler comes in
-           a later step.
+           `--sync-once` runs one round: commit, rebase onto the remote, push. `--interval N`
+           installs a per-user schedule (launchd, systemd user timer or Windows task) that runs
+           that round every N minutes; `--remove-schedule` or going back to solo/phone removes it.
 
 An always-on hub is discussed in #205 and not exposed yet.
 
@@ -21,7 +22,9 @@ Rules this module keeps:
   file in the machine-local runtime state and, at the computers level, git metadata (a git
   directory outside the vault, a remote URL, and a managed block in the git directory's
   info/exclude and info/attributes that keeps each machine's installation files out of git);
-  it never writes into the vault. `--sync-once`
+  it never writes into the vault. A schedule writes only its own per-user scheduler files and
+  is removed only after its recorded content hashes still match (devices-schedulers.json), so a
+  file or task with the same name that Beyin did not create is never touched. `--sync-once`
   talks to the configured remote: that is its whole purpose.
 - A rebase that stops on a conflict is aborted, so the working tree (which a phone may be reading
   through a file sync service) never carries conflict markers. Local commits stay; the conflict
@@ -31,9 +34,12 @@ Rules this module keeps:
 - Standard library only.
 """
 import calendar
+from contextlib import contextmanager, nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import secrets
 import shlex
 import re
@@ -46,6 +52,11 @@ import urllib.parse
 SETTINGS_FILE = 'devices.json'
 RECORD_FILE = 'devices-sync.json'
 LOCK_FILE = 'devices-sync.lock'
+LOG_FILE = 'devices-sync.log'
+OWNERSHIP_FILE = 'devices-schedulers.json'
+SCHEDULER_LOCK = 'devices-schedulers.lock'
+MIN_INTERVAL = 5
+MAX_INTERVAL = 1440
 LEVELS = ('solo', 'phone', 'computers')
 PHONE_SYNCS = ('icloud', 'obsidian-sync', 'other')
 GIT_TIMEOUT = 20
@@ -119,7 +130,12 @@ def _atomic(path, text):
 
 def default_settings():
     return {'schema': 1, 'level': 'solo', 'phone_sync': None, 'git_dir': None, 'remote_name': 'origin',
-            'branch': 'main'}
+            'branch': 'main', 'interval': 0, 'scheduler': None}
+
+
+def _interval_ok(interval):
+    return (not isinstance(interval, bool) and isinstance(interval, int)
+            and (interval == 0 or MIN_INTERVAL <= interval <= MAX_INTERVAL))
 
 
 def _valid(data):
@@ -133,6 +149,12 @@ def _valid(data):
     for key in ('remote_name', 'branch'):
         if not (isinstance(data.get(key), str) and _NAME.fullmatch(data[key]) and '..' not in data[key]):
             return False
+    if not _interval_ok(data.get('interval')) or (data['interval'] and data['level'] != 'computers'):
+        return False
+    scheduler = data.get('scheduler')
+    if scheduler is not None and not (isinstance(scheduler, dict) and isinstance(scheduler.get('kind'), str)
+                                      and isinstance(scheduler.get('label'), str)):
+        return False
     if data['level'] == 'solo':
         return data['phone_sync'] is None
     return data['level'] == 'computers' or data['phone_sync'] is not None
@@ -181,6 +203,8 @@ def doctor(state):
               'phone_sync': settings['phone_sync']}
     if settings['level'] == 'computers':
         result['git_dir'] = settings['git_dir']
+        result['interval'] = settings['interval']
+        result['scheduler'] = (settings['scheduler'] or {}).get('kind')
     if record:
         result['last_sync'] = {key: record.get(key) for key in ('status', 'at', 'reason') if record.get(key) is not None}
         try:
@@ -331,19 +355,26 @@ def normalize(options, state):
     elif level == 'phone' and not phone_sync:
         raise DevicesError('--level phone needs --phone-sync ' + '|'.join(PHONE_SYNCS))
     if level != 'computers':
-        for key in ('git_dir', 'remote'):
+        for key in ('git_dir', 'remote', 'interval'):
             if options.get(key):
                 raise DevicesError('--' + key.replace('_', '-') + ' belongs to --level computers')
+    interval = options['interval'] if options.get('interval') is not None else stored['interval']
+    if level != 'computers':
+        interval = 0
+    if not _interval_ok(interval):
+        raise DevicesError('--interval is minutes between sync rounds: 0 (off) or ' + str(MIN_INTERVAL) + '..' +
+                           str(MAX_INTERVAL))
     git_dir = stored['git_dir']
     if options.get('git_dir'):
         given = Path(str(options['git_dir'])).expanduser()
         if not given.is_absolute():
             raise DevicesError('--git-dir must be an absolute path')
         git_dir = str(given.resolve())
-    return {**stored, 'schema': 1, 'level': level, 'phone_sync': phone_sync, 'git_dir': git_dir}
+    return {**stored, 'schema': 1, 'level': level, 'phone_sync': phone_sync, 'git_dir': git_dir,
+            'interval': interval}
 
 
-def plan(vault, state, options):
+def plan(vault, state, options, home=None, scheduler_dir=None):
     """What `--apply` would store and what is left for the user. Writes nothing."""
     vault, state = Path(vault), Path(state)
     settings = normalize(options, state)
@@ -390,6 +421,12 @@ def plan(vault, state, options):
         actions, steps, notes = _computers_plan(vault, settings, options.get('remote'))
         manual.extend(steps)
         warnings.extend(notes)
+    schedule, steps, notes = _schedule_plan(vault, state, settings, stored if valid else default_settings(),
+                                            home, scheduler_dir)
+    actions = schedule['remove'] + actions + schedule['install']
+    manual.extend(steps)
+    warnings.extend(notes)
+    settings = {**settings, 'scheduler': schedule['scheduler']}
     return {'level': settings['level'], 'phone_sync': choice, 'manual_steps': manual, 'warnings': warnings,
             'actions': actions, 'settings': settings, 'changes_settings': not valid or settings != stored}
 
@@ -399,17 +436,31 @@ def public_plan(result):
     shown = {key: value for key, value in result.items()
              if key != 'settings' and not (key == 'actions' and not value)}
     if shown.get('actions'):
-        shown['actions'] = [{key: value for key, value in action.items() if key != 'lines'}
+        shown['actions'] = [{key: value for key, value in action.items() if key not in ('lines', 'spec')}
                              for action in shown['actions']]
     return shown
 
 
-def apply(vault, state, options):
-    """Store the chosen level in the runtime state and run the planned git steps. Nothing in the
-    vault is written."""
-    planned = plan(vault, state, options)
+def apply(vault, state, options, home=None, scheduler_dir=None, runner=None):
+    """Store the chosen level in the runtime state and run the planned git and schedule steps.
+    Nothing in the vault is written. Settings are stored last, so a failed step leaves them as
+    they were and the same command can run again."""
+    planned = plan(vault, state, options, home, scheduler_dir)
+    changes_scheduler = any(action['kind'].startswith('scheduler') for action in planned['actions'])
+    with _scheduler_guard(state) if changes_scheduler else nullcontext():
+        if changes_scheduler:  # planned again under the lock: another change may have finished meanwhile
+            planned = plan(vault, state, options, home, scheduler_dir)
+        return _apply_plan(vault, state, planned, home, scheduler_dir, runner)
+
+
+def _apply_plan(vault, state, planned, home, scheduler_dir, runner):
     for action in planned['actions']:
-        _execute(vault, planned['settings'], action)
+        if action['kind'] == 'scheduler':
+            _install_scheduler(vault, state, action['spec'], scheduler_dir, runner, home)
+        elif action['kind'] == 'scheduler_remove':
+            _remove_scheduler(vault, state, action['spec'], scheduler_dir, runner, home)
+        else:
+            _execute(vault, planned['settings'], action)
     if planned['changes_settings']:
         _atomic(Path(state) / SETTINGS_FILE, json.dumps(planned['settings'], ensure_ascii=False, indent=2) + '\n')
     changed = planned['changes_settings'] or bool(planned['actions'])
@@ -828,3 +879,324 @@ def sync_once(vault, state):
         result['seconds'] = round(time.time() - started, 1)
         _atomic(state / RECORD_FILE, json.dumps(result, ensure_ascii=False, indent=2) + '\n')
         return result
+
+
+# ---------------------------------------------------------------- schedule
+#
+# One per-user schedule per vault runs `devices --sync-once`. Its name carries a short hash of the
+# vault path, so two installations on different paths never share a schedule. Every file Beyin
+# writes for it is recorded with its content hash in the runtime state (devices-schedulers.json);
+# removal first checks that record, the files and (on Windows) the registered task, and refuses
+# anything it did not create or that changed since.
+
+_SCHEDULER_FILES = {
+    'launchd': ('com.avenox.beyin-devices.', ('.plist',)),
+    'systemd-user': ('beyin-devices-', ('.service', '.timer')),
+    'schtasks': ('BeyinDevices-', ('.json',)),
+}
+
+
+def _vault_key(vault):
+    return hashlib.sha256(str(Path(vault)).encode('utf-8')).hexdigest()[:8]
+
+
+def scheduler_kind(platform=None, environ=None):
+    platform = platform or sys.platform
+    environ = os.environ if environ is None else environ
+    if platform == 'darwin':
+        return 'launchd'
+    if platform.startswith('win'):
+        return 'schtasks'
+    if shutil.which('systemctl') and environ.get('XDG_RUNTIME_DIR') and \
+            Path(environ['XDG_RUNTIME_DIR'], 'systemd').is_dir():
+        return 'systemd-user'
+    return 'cron' if shutil.which('crontab') else 'none'
+
+
+def _sync_command(vault, state):
+    entry = Path(vault) / 'beyin.py'
+    if entry.is_file():
+        return [sys.executable, str(entry), 'devices', '--sync-once']
+    cli = Path(__file__).with_name('beyin_v3_cli.py')
+    if not cli.is_file():
+        cli = Path(__file__).resolve().parents[3] / 'scripts/beyin_v3.py'
+    return [sys.executable, str(cli), '--vault', str(vault), '--state', str(state), 'devices', '--sync-once']
+
+
+def _systemd_quote(argument):
+    return '"' + argument.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+
+
+def _uid():
+    return str(os.getuid() if hasattr(os, 'getuid') else 0)
+
+
+def _scheduler_paths(vault, state, kind, label, scheduler_dir=None, home=None):
+    prefix, suffixes = _SCHEDULER_FILES.get(kind, ('', ())) if isinstance(kind, str) else ('', ())
+    if (not suffixes or not isinstance(label, str)
+            or not re.fullmatch(re.escape(prefix) + r'[a-z0-9-]+', label)
+            or label != prefix + _vault_key(vault)):
+        raise DevicesError('Scheduler ownership refused: invalid label for this vault.')
+    if scheduler_dir is None:
+        home = Path(home) if home is not None else Path.home()
+        scheduler_dir = (home / 'Library/LaunchAgents' if kind == 'launchd' else
+                         Path(state) / 'scheduler' if kind == 'schtasks' else home / '.config/systemd/user')
+    return [Path(scheduler_dir) / (label + suffix) for suffix in suffixes]
+
+
+def scheduler_spec(vault, state, interval, kind=None, home=None, command=None, scheduler_dir=None):
+    """Files and commands that run one sync round every `interval` minutes on this platform.
+    Pure: returns the plan, runs nothing."""
+    kind = kind or scheduler_kind()
+    command = command or _sync_command(vault, state)
+    key = _vault_key(vault)
+    log = str(Path(state) / LOG_FILE)
+    if kind == 'launchd':
+        label = 'com.avenox.beyin-devices.' + key
+        path, = _scheduler_paths(vault, state, kind, label, scheduler_dir, home)
+        content = plistlib.dumps({
+            'Label': label, 'ProgramArguments': command, 'StartInterval': interval * 60, 'RunAtLoad': True,
+            'ProcessType': 'Background', 'StandardOutPath': log, 'StandardErrorPath': log,
+        }).decode('utf-8')
+        return {'kind': kind, 'label': label, 'files': {str(path): content},
+                'load': [['launchctl', 'bootstrap', 'gui/' + _uid(), str(path)]]}
+    if kind == 'systemd-user':
+        unit = 'beyin-devices-' + key
+        service_path, timer_path = _scheduler_paths(vault, state, kind, unit, scheduler_dir, home)
+        service = ('[Unit]\nDescription=Beyin devices sync round\n\n[Service]\nType=oneshot\n'
+                   'ExecStart=' + ' '.join(_systemd_quote(item) for item in command) + '\n')
+        timer = ('[Unit]\nDescription=Beyin devices sync timer\n\n[Timer]\nOnBootSec=2min\n'
+                 'OnUnitActiveSec=' + str(interval) + 'min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n')
+        return {'kind': kind, 'label': unit, 'files': {str(service_path): service, str(timer_path): timer},
+                'load': [['systemctl', '--user', 'daemon-reload'],
+                         ['systemctl', '--user', 'enable', '--now', unit + '.timer']]}
+    if kind == 'schtasks':
+        name = 'BeyinDevices-' + key
+        path, = _scheduler_paths(vault, state, kind, name, scheduler_dir, home)
+        windowless = Path(command[0]).with_name('pythonw.exe')
+        argv = [str(windowless) if windowless.is_file() else command[0], *command[1:]]
+        create = ['schtasks', '/Create', '/SC', 'MINUTE', '/MO', str(interval), '/TN', name, '/TR',
+                  subprocess.list2cmdline(argv)]
+        return {'kind': kind, 'label': name, 'files': {str(path): json.dumps(create) + '\n'}, 'load': [create]}
+    quoted = ' '.join(shlex.quote(item) for item in command)
+    if kind == 'cron':
+        when = ('*/' + str(interval) + ' * * * *') if interval < 60 else ('0 */' + str(max(1, interval // 60)) + ' * * *')
+        manual = 'Add this line with `crontab -e`: ' + when + ' ' + quoted + ' >> ' + shlex.quote(log) + ' 2>&1'
+    else:
+        manual = ('No scheduler was found (for example inside a container). Run this from your own startup script: '
+                  'while true; do ' + quoted + '; sleep ' + str(interval * 60) + '; done')
+    return {'kind': kind, 'label': None, 'files': {}, 'load': [], 'manual': manual}
+
+
+def _hashes(spec, paths):
+    return {path.name: hashlib.sha256(spec['files'][str(path)].encode('utf-8')).hexdigest() for path in paths}
+
+
+def _schedule_plan(vault, state, settings, stored, home, scheduler_dir):
+    """Schedule steps: ({'remove': [...], 'install': [...], 'scheduler': record}, manual, warnings)."""
+    manual, warnings, install, wanted = [], [], [], None
+    records = _read_ownership(state)
+    if settings['level'] == 'computers' and settings['interval']:
+        spec = scheduler_spec(vault, state, settings['interval'], home=home, scheduler_dir=scheduler_dir)
+        if spec['files']:
+            wanted = {'kind': spec['kind'], 'label': spec['label']}
+            if not _installed_as(vault, state, spec, records, scheduler_dir, home):
+                install.append({'kind': 'scheduler', 'spec': spec, 'summary': 'run a sync round every ' +
+                                str(settings['interval']) + ' minutes (' + spec['kind'] + ')'})
+            if spec['kind'] == 'launchd' and vault_synced(vault, settings['phone_sync']):
+                warnings.append('macOS blocks background jobs from reading iCloud Drive, Documents and Desktop. Give '
+                                'Full Disk Access to this Python (' + sys.executable + ') in System Settings > Privacy '
+                                '& Security, or the scheduled round fails with "Operation not permitted".')
+        else:
+            manual.append(spec['manual'])
+    elif settings['level'] == 'computers':
+        manual.append('No schedule was requested. Run `beyin.py devices --sync-once` when you start and finish work, '
+                      'or apply again with --interval 15.')
+    remove = [{'kind': 'scheduler_remove', 'spec': old, 'summary': 'remove the previous sync schedule (' +
+               str(old.get('kind')) + ')'}
+              for old in _recorded_schedules(vault, stored, records) if old != wanted]
+    return {'remove': remove, 'install': install, 'scheduler': wanted}, manual, warnings
+
+
+def _installed_as(vault, state, spec, records, scheduler_dir, home):
+    """Whether exactly this schedule is already registered and untouched."""
+    paths = _scheduler_paths(vault, state, spec['kind'], spec['label'], scheduler_dir, home)
+    record = records.get(spec['label'])
+    if not isinstance(record, dict) or not record.get('active') or record.get('files') != _hashes(spec, paths):
+        return False
+    try:
+        _verify_ownership(records, spec['kind'], spec['label'], paths)
+    except DevicesError:
+        return False  # installing again reports the exact reason
+    return True
+
+
+def _recorded_schedules(vault, settings, records):
+    found = [settings['scheduler']] if settings.get('scheduler') else []
+    for kind, (prefix, _) in _SCHEDULER_FILES.items():
+        spec = {'kind': kind, 'label': prefix + _vault_key(vault)}
+        if spec['label'] in records and spec not in found:
+            found.append(spec)
+    return found
+
+
+def _run(argv, timeout=60):
+    try:
+        done = subprocess.run(argv, shell=False, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, errors='replace', timeout=timeout)
+    except FileNotFoundError:
+        return 127, argv[0] + ' not found'
+    except subprocess.TimeoutExpired:
+        return 124, 'timeout'
+    return done.returncode, (done.stdout if done.returncode == 0 else done.stderr or done.stdout)
+
+
+def _scheduler_command(runner, argv):
+    code, output = (runner or _run)(argv)
+    if code:
+        raise DevicesError(' '.join(argv[:3]) + ' failed: ' + _tail(output))
+    return output
+
+
+def _read_ownership(state):
+    try:
+        records = json.loads((Path(state) / OWNERSHIP_FILE).read_text(encoding='utf-8'))
+        if isinstance(records, dict):
+            return records
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        pass
+    raise DevicesError('Scheduler ownership file ' + OWNERSHIP_FILE + ' is unreadable or invalid.')
+
+
+def _write_ownership(state, records):
+    _atomic(Path(state) / OWNERSHIP_FILE, json.dumps(records, indent=2) + '\n')
+
+
+def _task_hash(label, runner):
+    output = _scheduler_command(runner, ['schtasks', '/Query', '/TN', label, '/XML'])
+    if not output.strip():
+        raise DevicesError('Scheduler ownership refused: the registered task definition was empty.')
+    return hashlib.sha256(output.encode('utf-8')).hexdigest()
+
+
+def _verify_ownership(records, kind, label, paths):
+    record = records.get(label)
+    if not isinstance(record, dict) or record.get('kind') != kind or not isinstance(record.get('files'), dict):
+        raise DevicesError('Scheduler ownership refused: no creation record for ' + label + '.')
+    if record.get('directory') != str(paths[0].parent.resolve()):
+        raise DevicesError('Scheduler ownership refused: the scheduler directory changed.')
+    if set(record['files']) != {path.name for path in paths}:
+        raise DevicesError('Scheduler ownership refused: unexpected file list for ' + label + '.')
+    for path in paths:
+        if (path.is_symlink() or not path.is_file()
+                or hashlib.sha256(path.read_bytes()).hexdigest() != record['files'][path.name]):
+            raise DevicesError('Scheduler ownership refused: missing or changed file ' + path.name + '.')
+    return record
+
+
+def _scheduler_available(kind, label, paths, runner):
+    run = runner or _run
+    if kind == 'schtasks':
+        if run(['schtasks', '/Query', '/TN', label, '/XML'])[0] == 0:
+            raise DevicesError('Scheduler ownership refused: a task already exists for ' + label + '.')
+    elif kind == 'launchd':
+        if run(['launchctl', 'print', 'gui/' + _uid() + '/' + label])[0] == 0:
+            raise DevicesError('Scheduler ownership refused: a LaunchAgent already exists for ' + label + '.')
+    else:
+        for path in paths:
+            _, output = run(['systemctl', '--user', 'show', '--property=LoadState', '--value', path.name])
+            if output.strip() != 'not-found':
+                raise DevicesError('Scheduler ownership refused: could not verify that ' + path.name +
+                                   ' is absent. ' + _tail(output))
+
+
+def _remove_scheduler(vault, state, spec, scheduler_dir=None, runner=None, home=None):
+    kind, label = (spec.get('kind'), spec.get('label')) if isinstance(spec, dict) else (None, None)
+    paths = _scheduler_paths(vault, state, kind, label, scheduler_dir, home)
+    records = _read_ownership(state)
+    record = _verify_ownership(records, kind, label, paths)
+    if record.get('active'):
+        if kind == 'schtasks':
+            if not record.get('task_hash') or _task_hash(label, runner) != record['task_hash']:
+                raise DevicesError('Scheduler ownership refused: the registered task definition changed.')
+            unload = ['schtasks', '/Delete', '/F', '/TN', label]
+        elif kind == 'launchd':
+            unload = ['launchctl', 'bootout', 'gui/' + _uid() + '/' + label]
+        else:
+            unload = ['systemctl', '--user', 'disable', '--now', paths[-1].name]
+        _scheduler_command(runner, unload)
+    _verify_ownership(records, kind, label, paths)
+    for path in paths:
+        path.unlink()
+    del records[label]
+    _write_ownership(state, records)
+    if kind == 'systemd-user':
+        _scheduler_command(runner, ['systemctl', '--user', 'daemon-reload'])
+
+
+def _install_scheduler(vault, state, spec, scheduler_dir, runner, home):
+    kind, label = spec['kind'], spec['label']
+    paths = _scheduler_paths(vault, state, kind, label, scheduler_dir, home)
+    hashes = _hashes(spec, paths)
+    records = _read_ownership(state)
+    if label in records:
+        record = _verify_ownership(records, kind, label, paths)
+        if record['files'] != hashes:
+            _remove_scheduler(vault, state, spec, scheduler_dir, runner, home)
+            records = _read_ownership(state)
+    if label not in records:
+        if any(os.path.lexists(path) for path in paths):
+            raise DevicesError('Scheduler ownership refused: a file already exists for ' + label + '; Beyin did not '
+                               'create it and leaves it alone.')
+        _scheduler_available(kind, label, paths, runner)
+        created = []
+        try:
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open('xb') as handle:
+                    created.append(path)
+                    handle.write(spec['files'][str(path)].encode('utf-8'))
+            records[label] = {'kind': kind, 'directory': str(paths[0].parent.resolve()), 'files': hashes,
+                              'active': False}
+            _write_ownership(state, records)
+        except OSError:
+            for path in created:
+                path.unlink()
+            raise
+    for argv in spec['load']:
+        _scheduler_command(runner, argv)
+    if kind == 'schtasks':
+        records[label]['task_hash'] = _task_hash(label, runner)
+    records[label]['active'] = True
+    _write_ownership(state, records)
+
+
+@contextmanager
+def _scheduler_guard(state):
+    state = Path(state)
+    state.mkdir(parents=True, exist_ok=True)
+    with (state / SCHEDULER_LOCK).open('a+b') as handle:
+        if not _lock(handle):
+            raise DevicesError('Another schedule change is in progress. Try again after it finishes.')
+        yield
+
+
+def remove_scheduler(vault, state, scheduler_dir=None, runner=None, home=None):
+    """`--remove-schedule`: remove the schedule this vault recorded; the level stays."""
+    vault = Path(vault).resolve()
+    settings, valid = read_settings(state)
+    if not valid:
+        raise DevicesError(SETTINGS_FILE + ' in the runtime state is invalid; fix or remove it first')
+    if not _recorded_schedules(vault, settings, _read_ownership(state)):
+        return {'status': 'unchanged', 'scheduler': None}
+    with _scheduler_guard(state):
+        settings, _ = read_settings(state)
+        removed = []
+        for spec in _recorded_schedules(vault, settings, _read_ownership(state)):
+            _remove_scheduler(vault, state, spec, scheduler_dir, runner, home)
+            removed.append(spec)
+        settings.update({'scheduler': None, 'interval': 0})
+        _atomic(Path(state) / SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=2) + '\n')
+    return {'status': 'removed', 'scheduler': removed[0]['kind'], 'label': removed[0]['label']}
